@@ -132,5 +132,5 @@ void loop() {
     input_update();
     ui_manager_update();
     lv_timer_handler();
-    delay(5);
+    delay(2);
 }
