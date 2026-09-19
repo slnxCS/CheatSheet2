@@ -66,6 +66,8 @@ bool camera_init() {
         s->set_gainceiling(s, (gainceiling_t)6);
         s->set_bpc(s, 1);            // dead pixel correction (fixes green dots)
         s->set_wpc(s, 1);            // white pixel correction
+        s->set_hmirror(s, 1);        // mirror horizontally (sensor is rotated on board)
+        s->set_vflip(s, 1);          // flip vertically (sensor is rotated on board)
     }
 
     cam_ready = true;
@@ -87,9 +89,6 @@ bool camera_capture(uint8_t** buf, size_t* len) {
         Serial.println("Camera capture failed");
         return false;
     }
-
-    *buf = current_fb->buf;
-    *len = current_fb->len;
     return true;
 }
 

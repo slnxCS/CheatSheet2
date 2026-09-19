@@ -31,9 +31,10 @@ static uint32_t canvas_stride = 0;
 static bool preview_active = false;
 static bool saving = false;
 
-// Rotate -90° + mirror + scale: src(src_w×src_h) → dst(dst_w×dst_h)
-static void rotate_scale(const uint16_t* src, int src_w, int src_h,
-                          uint16_t* dst, int dst_w, int dst_h, uint32_t dst_stride) {
+// Scale: src(src_w×src_h) → dst(dst_w×dst_h)
+// Поворот больше не нужен — hmirror/vflip на сенсоре
+static void scale_only(const uint16_t* src, int src_w, int src_h,
+                       uint16_t* dst, int dst_w, int dst_h, uint32_t dst_stride) {
     if (src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0) return;
 
     int32_t sy_step = ((int32_t)src_h << 16) / dst_w;
@@ -46,8 +47,8 @@ static void rotate_scale(const uint16_t* src, int src_w, int src_h,
         for (int dx = 0; dx < dst_w; dx++) {
             int32_t sy_fixed = dx * sy_step;
 
-            int32_t src_x = src_w - 1 - (sx_fixed >> 16);
-            int32_t src_y = src_h - 1 - (sy_fixed >> 16);
+            int32_t src_x = sx_fixed >> 16;
+            int32_t src_y = sy_fixed >> 16;
 
             if (src_x < 0) src_x = 0;
             if (src_x >= src_w) src_x = src_w - 1;
@@ -78,8 +79,8 @@ static void refresh_cb(lv_timer_t* timer) {
                               temp_buf, 200, 150, 200 * 2, 4,
                               &dec_w, &dec_h)) {
         if (dec_w > 0 && dec_h > 0) {
-            rotate_scale((uint16_t*)temp_buf, dec_w, dec_h,
-                          (uint16_t*)canvas_buf, IMG_W, IMG_H, canvas_stride);
+            scale_only((uint16_t*)temp_buf, dec_w, dec_h,
+                       (uint16_t*)canvas_buf, IMG_W, IMG_H, canvas_stride);
             lv_obj_invalidate(canvas);
         }
     }
@@ -240,14 +241,13 @@ void camera_app_button(int button_id, int event) {
             return;
         }
 
-        // Show captured image at HALF resolution (400×300 — enough for text)
         int dec_w = 0, dec_h = 0;
         if (jpeg_decode_to_rgb565(jpeg_buf, jpeg_len,
                                   temp_buf, 400, 300, 400 * 2, 2,
                                   &dec_w, &dec_h)) {
             if (dec_w > 0 && dec_h > 0) {
-                rotate_scale((uint16_t*)temp_buf, dec_w, dec_h,
-                              (uint16_t*)canvas_buf, IMG_W, IMG_H, canvas_stride);
+                scale_only((uint16_t*)temp_buf, dec_w, dec_h,
+                           (uint16_t*)canvas_buf, IMG_W, IMG_H, canvas_stride);
                 lv_obj_invalidate(canvas);
             }
         }
