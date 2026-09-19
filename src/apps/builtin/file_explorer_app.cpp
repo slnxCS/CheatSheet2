@@ -11,7 +11,7 @@
 #define MAX_PATH 128
 #define MAX_ENTRIES 32
 #define MAX_NAME 64
-#define VISIBLE_ITEMS 7
+#define VISIBLE_ITEMS 8
 #define TEXT_BUF_SIZE 4096
 
 struct FileEntry {
@@ -152,6 +152,8 @@ static void scan_directory() {
     if (current_src == SRC_INTERNAL && !littlefs_mounted) return;
     if (current_src == SRC_SD && !sd_mounted) return;
 
+    Serial.printf("Current path %s: \n", current_path);
+
     File dir;
     if (current_src == SRC_INTERNAL) dir = LittleFS.open(current_path, "r");
     else dir = SD_MMC.open(current_path, "r");
@@ -166,21 +168,20 @@ static void scan_directory() {
         entry_count = 1;
     }
 
-    File f = dir.openNextFile();
-    while (f && entry_count < MAX_ENTRIES) {
-        const char* n = f.name();
-        const char* base = strrchr(n, '/');
-        if (base) base++; else base = n;
-        if (base[0] == '.' && strcmp(base, "..") != 0) {
-            f = dir.openNextFile();
-            continue;
-        }
+    for (File f = dir.openNextFile(); f; f = dir.openNextFile(), entry_count++) {
+        const char* name = f.name();
+        const char* base = strrchr(name, '/');
+
+        Serial.printf("[Explorer at %s] : %d. %s\n", current_path, entry_count, name);
+        
+        if (base) base++;
+        else base = name;
+
+        if (base[0] == '.' && strcmp(base, "..") != 0) continue;
         strncpy(entries[entry_count].name, base, MAX_NAME - 1);
         entries[entry_count].name[MAX_NAME - 1] = '\0';
         entries[entry_count].is_dir = f.isDirectory();
         entries[entry_count].size = f.size();
-        entry_count++;
-        f = dir.openNextFile();
     }
     dir.close();
 }
