@@ -9,3 +9,5 @@ void camera_deinit();
 bool camera_capture(uint8_t** buf, size_t* len);
 void camera_release();
 bool camera_is_ready();
+void camera_set_brightness(int val);
+void camera_set_focus(int pos);

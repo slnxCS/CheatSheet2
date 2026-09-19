@@ -5,8 +5,36 @@
 #ifdef BOARD_HAS_PSRAM
 #include "esp_camera.h"
 
+// OV5640 VCM (Voice Coil Motor) focus registers
+#define OV5640_MODULE_ID_ADDR   0x3000
+#define OV5640_SC_PRE_BIAS_ADDR 0x5218
+#define OV5640_SC_MAST_BIAS_ADDR 0x5217
+#define OV5640_SC_LINE_ADDR     0x5216
+#define OV5640_SC_STEP_ADDR     0x5215
+
 static bool cam_ready = false;
 static camera_fb_t* current_fb = nullptr;
+static int current_focus = 512;
+
+// Запись в регистр через SCCB (I2C камеры)
+static void ov5640_write_reg(uint16_t reg, uint8_t val) {
+    sensor_t* s = esp_camera_sensor_get();
+    if (s) s->set_reg(s, reg, 0xFF, val);
+}
+
+static void ov5640_set_focus(int pos) {
+    // OV5640 VCM control: разбиваем позицию на 3 регистра
+    uint8_t h = (pos >> 8) & 0x03;
+    uint8_t m = (pos >> 4) & 0x0F;
+    uint8_t l = pos & 0x0F;
+
+    ov5640_write_reg(0x5218, (h << 4) | l);  // SC_PRE_BIAS
+    ov5640_write_reg(0x5217, m);              // SC_MAST_BIAS
+    ov5640_write_reg(0x5216, 0x01);           // SC_LINE = 1 (manual mode)
+    ov5640_write_reg(0x5215, 0x01);           // SC_STEP = 1 (enable direct control)
+
+    Serial.printf("Focus set: %d\n", pos);
+}
 
 bool camera_init() {
     camera_config_t config = {};
@@ -32,8 +60,8 @@ bool camera_init() {
     config.pixel_format = PIXFORMAT_JPEG;
 
     if (psramFound()) {
-        config.frame_size = FRAMESIZE_SVGA;  // 800x600 — достаточно для текста, быстро
-        config.jpeg_quality = 12;
+        config.frame_size = FRAMESIZE_UXGA;  // 1600x1200
+        config.jpeg_quality = 8;              // высокое качество (0-63)
         config.fb_count = 2;
         config.grab_mode = CAMERA_GRAB_LATEST;
         config.fb_location = CAMERA_FB_IN_PSRAM;
@@ -53,25 +81,25 @@ bool camera_init() {
     sensor_t* s = esp_camera_sensor_get();
     if (s) {
         s->set_brightness(s, 0);
-        s->set_saturation(s, -1);    // slightly less saturation to reduce color artifacts
-        s->set_contrast(s, 1);       // slightly more contrast for text readability
-        s->set_sharpness(s, 2);      // sharpen for text
-        s->set_denoise(s, 1);        // reduce noise
-        s->set_awb_gain(s, 1);       // enable AWB gain
-        s->set_wb_mode(s, 0);        // auto white balance
-        s->set_exposure_ctrl(s, 1);  // auto exposure
-        s->set_aec2(s, 1);           // AEC DSP
-        s->set_gain_ctrl(s, 1);      // auto gain
-        s->set_agc_gain(s, 0);       // no manual gain
+        s->set_saturation(s, -1);
+        s->set_contrast(s, 1);
+        s->set_sharpness(s, 2);
+        s->set_denoise(s, 1);
+        s->set_awb_gain(s, 1);
+        s->set_wb_mode(s, 0);
+        s->set_exposure_ctrl(s, 1);
+        s->set_aec2(s, 1);
+        s->set_gain_ctrl(s, 1);
+        s->set_agc_gain(s, 0);
         s->set_gainceiling(s, (gainceiling_t)6);
-        s->set_bpc(s, 1);            // dead pixel correction (fixes green dots)
-        s->set_wpc(s, 1);            // white pixel correction
-        s->set_hmirror(s, 1);        // mirror horizontally (sensor is rotated on board)
-        s->set_vflip(s, 1);          // flip vertically (sensor is rotated on board)
+        s->set_bpc(s, 1);
+        s->set_wpc(s, 1);
+        s->set_hmirror(s, 1);
+        s->set_vflip(s, 1);
     }
 
     cam_ready = true;
-    Serial.println("Camera OK");
+    Serial.println("Camera OK (UXGA 1600x1200)");
     return true;
 }
 
@@ -106,6 +134,20 @@ bool camera_is_ready() {
     return cam_ready;
 }
 
+void camera_set_brightness(int val) {
+    if (!cam_ready) return;
+    sensor_t* s = esp_camera_sensor_get();
+    if (s) s->set_brightness(s, val);
+}
+
+void camera_set_focus(int pos) {
+    if (!cam_ready) return;
+    if (pos < 0) pos = 0;
+    if (pos > 1023) pos = 1023;
+    current_focus = pos;
+    ov5640_set_focus(pos);
+}
+
 #else
 
 bool camera_init() {
@@ -116,5 +158,7 @@ void camera_deinit() {}
 bool camera_capture(uint8_t** buf, size_t* len) { return false; }
 void camera_release() {}
 bool camera_is_ready() { return false; }
+void camera_set_brightness(int val) {}
+void camera_set_focus(int pos) {}
 
 #endif
