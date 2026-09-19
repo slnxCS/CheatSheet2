@@ -152,8 +152,6 @@ static void scan_directory() {
     if (current_src == SRC_INTERNAL && !littlefs_mounted) return;
     if (current_src == SRC_SD && !sd_mounted) return;
 
-    Serial.printf("Current path %s: \n", current_path);
-
     File dir;
     if (current_src == SRC_INTERNAL) dir = LittleFS.open(current_path, "r");
     else dir = SD_MMC.open(current_path, "r");
@@ -168,20 +166,25 @@ static void scan_directory() {
         entry_count = 1;
     }
 
-    for (File f = dir.openNextFile(); f; f = dir.openNextFile(), entry_count++) {
+    for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
         const char* name = f.name();
         const char* base = strrchr(name, '/');
-
-        Serial.printf("[Explorer at %s] : %d. %s\n", current_path, entry_count, name);
-        
         if (base) base++;
         else base = name;
 
+        // Пропускаем записи с именем точки монтирования (sdcard, littlefs)
+        if ((current_src == SRC_SD && strcmp(base, "sdcard") == 0) ||
+            (current_src == SRC_INTERNAL && strcmp(base, "littlefs") == 0)) {
+            continue;
+        }
+
         if (base[0] == '.' && strcmp(base, "..") != 0) continue;
+
         strncpy(entries[entry_count].name, base, MAX_NAME - 1);
         entries[entry_count].name[MAX_NAME - 1] = '\0';
         entries[entry_count].is_dir = f.isDirectory();
         entries[entry_count].size = f.size();
+        entry_count++;
     }
     dir.close();
 }
