@@ -30,9 +30,6 @@ static uint32_t canvas_stride = 0;
 
 static bool preview_active = false;
 static bool saving = false;
-static bool fs_ready = false;
-
-static bool sd_ready = false;
 
 // Rotate -90° + mirror + scale: src(src_w×src_h) → dst(dst_w×dst_h)
 static void rotate_scale(const uint16_t* src, int src_w, int src_h,
@@ -107,9 +104,9 @@ static bool save_photo(const uint8_t* jpeg_data, size_t jpeg_len) {
         break;
     }
 
-    if (!fs_ready) return false;
-
-    
+    if (!fs->exists("/images")) {
+        fs->mkdir("/images");
+    }
 
     if (free_bytes < jpeg_len + 4096) {
         Serial.printf("not enough space (%u free, need %u)\n",

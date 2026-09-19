@@ -60,6 +60,20 @@ static const char* get_root_path() {
     return "/";
 }
 
+static FS* get_current_FS() {
+    switch (current_src)
+    {
+        case SRC_SD :
+            return &SD_MMC;
+        case SRC_INTERNAL :
+            return &LittleFS;
+        default:
+            Serial.printf("Unknown file system: %d\n", (uint8_t)current_src);
+            return &LittleFS;
+    }
+}
+
+
 #define is_at_root() (current_path == get_root_path())
 
 // Проверка: текущий путь — корень?
@@ -80,7 +94,7 @@ static void reset_to_root() {
 
 // Построить полный путь из current_path + имя entry
 static String build_entry_path(const char* entry_name) {
-    return current_path + entry_name;
+    return current_path + "/" + entry_name;
 }
 
 // --- Файловые функции ---
@@ -345,9 +359,7 @@ static void open_text_viewer(String filepath, const char* filename) {
 }
 
 static void open_image_viewer(String filepath, const char* filename) {
-    File f;
-    if (current_src == SRC_INTERNAL) f = LittleFS.open(filepath, "r");
-    else f = SD_MMC.open(filepath, "r");
+    File f = get_current_FS()->open(filepath, FILE_READ);
 
     if (!f) return;
 
@@ -398,19 +410,6 @@ static void open_file(String filepath, const char* filename) {
         open_text_viewer(filepath, filename);
     } else if (is_image_file(filename)) {
         open_image_viewer(filepath, filename);
-    }
-}
-
-static FS* get_current_FS() {
-    switch (current_src)
-    {
-        case SRC_SD :
-            return &SD_MMC;
-        case SRC_INTERNAL :
-            return &LittleFS;
-        default:
-            Serial.printf("Unknown file system: %d\n", (uint8_t)current_src);
-            return &LittleFS;
     }
 }
 
@@ -605,7 +604,10 @@ void file_explorer_button(int button_id, int event) {
         }
     } 
     else if (button_id == BTN_ID_RIGHT) {
-        delete_file(current_path + entries[selected_idx].name);
+        delete_file(build_entry_path(entries[selected_idx].name));
+        cleanup_items();
+        scan_directory();
+        update_display();
     }
     else if (button_id == BTN_ID_OK) {
         if (entry_count == 0) return;
