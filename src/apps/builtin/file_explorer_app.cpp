@@ -51,6 +51,43 @@ static uint8_t* img_data = nullptr;
 static size_t img_data_size = 0;
 static lv_fs_path_ex_t img_mempath;
 
+// --- Хелперы для путей ---
+
+// Корень FS: LittleFS = "/", SD_MMC = "/sdcard"
+static const char* get_root_path() {
+    return (current_src == SRC_SD) ? "/sdcard" : "/";
+}
+
+// Проверка: текущий путь — корень?
+static bool is_at_root() {
+    const char* root = get_root_path();
+    size_t root_len = strlen(root);
+    if (strlen(current_path) < root_len) return false;
+    return (strncmp(current_path, root, root_len) == 0 &&
+            (current_path[root_len] == '\0' || current_path[root_len] == '/'));
+}
+
+// Установить путь в корень
+static void reset_to_root() {
+    strncpy(current_path, get_root_path(), MAX_PATH - 1);
+    size_t len = strlen(current_path);
+    if (len > 1 && current_path[len - 1] != '/') {
+        current_path[len] = '/';
+        current_path[len + 1] = '\0';
+    }
+}
+
+// Построить полный путь из current_path + имя entry
+static void build_entry_path(char* out, size_t out_size, const char* entry_name) {
+    size_t plen = strlen(current_path);
+    if (plen > 1 && current_path[plen - 1] != '/')
+        snprintf(out, out_size, "%s/%s", current_path, entry_name);
+    else
+        snprintf(out, out_size, "%s%s", current_path, entry_name);
+}
+
+// --- Файловые функции ---
+
 static bool is_text_file(const char* name) {
     const char* ext = strrchr(name, '.');
     if (!ext) return false;
@@ -94,11 +131,12 @@ static void format_size(uint32_t size, char* buf, size_t len) {
     else snprintf(buf, len, "%.1f MB", size / (1024.0f * 1024.0f));
 }
 
-static void count_dir_items(const char* path, DataSource src, int* out_count) {
+// Подсчёт файлов в папке (принимает ПОЛНЫЙ путь)
+static void count_dir_items(const char* fullpath, DataSource src, int* out_count) {
     int count = 0;
     File dir;
-    if (src == SRC_INTERNAL) dir = LittleFS.open(path, "r");
-    else if (src == SRC_SD && sd_mounted) dir = SD_MMC.open(path, "r");
+    if (src == SRC_INTERNAL) dir = LittleFS.open(fullpath, "r");
+    else if (src == SRC_SD && sd_mounted) dir = SD_MMC.open(fullpath, "r");
     if (dir && dir.isDirectory()) {
         File f = dir.openNextFile();
         while (f && count < 1000) { count++; f = dir.openNextFile(); }
@@ -120,7 +158,8 @@ static void scan_directory() {
 
     if (!dir || !dir.isDirectory()) return;
 
-    if (strcmp(current_path, "/") != 0) {
+    // Добавить ".." если не в корне
+    if (!is_at_root()) {
         strncpy(entries[0].name, "..", MAX_NAME - 1);
         entries[0].is_dir = true;
         entries[0].size = 0;
@@ -188,10 +227,13 @@ static void update_display() {
         lv_obj_set_pos(item_names[slot], 22, y);
         lv_obj_set_hidden(item_names[slot], false);
 
+        // Подсчёт файлов в папке — нужен ПОЛНЫЙ путь
         char info[20] = "";
         if (entries[i].is_dir && strcmp(entries[i].name, "..") != 0) {
+            char dirpath[MAX_PATH];
+            build_entry_path(dirpath, sizeof(dirpath), entries[i].name);
             int cnt = 0;
-            count_dir_items(entries[i].name, current_src, &cnt);
+            count_dir_items(dirpath, current_src, &cnt);
             snprintf(info, sizeof(info), "%d", cnt);
         } else if (!entries[i].is_dir) {
             format_size(entries[i].size, info, sizeof(info));
@@ -234,6 +276,8 @@ static void update_display() {
 
     lv_obj_invalidate(file_list);
 }
+
+// --- Просмотр ---
 
 static void close_viewer() {
     if (viewer_mode == VIEW_TEXT && text_buf) {
@@ -349,7 +393,7 @@ static void open_image_viewer(const char* filepath, const char* filename) {
     lv_obj_set_style_text_font(viewer_title, &lv_font_cyr_14, 0);
     lv_obj_align(viewer_title, LV_ALIGN_CENTER, 0, 0);
 
-    // Register JPEG data in MEMFS so LVGL TJPGD can decode it
+    // Регистрируем JPEG в MEMFS для декодирования LVGL TJPGD
     lv_fs_make_path_from_buffer(&img_mempath, LV_FS_MEMFS_LETTER, img_data, img_data_size, "jpg");
     viewer_content = lv_img_create(viewer_obj);
     lv_img_set_src(viewer_content, &img_mempath);
@@ -367,6 +411,51 @@ static void open_file(const char* filepath, const char* filename) {
         open_image_viewer(filepath, filename);
     }
 }
+
+// --- Навигация ---
+
+// Подъём на уровень вверх
+static void go_up() {
+    size_t len = strlen(current_path);
+    // Убираем trailing slash
+    if (len > 1 && current_path[len - 1] == '/') {
+        current_path[len - 1] = '\0';
+        len--;
+    }
+    // Ищем последний /
+    char* last_slash = strrchr(current_path, '/');
+    if (last_slash && last_slash != current_path)
+        *last_slash = '\0';
+    else {
+        // Дошли до корня — сбрасываем
+        reset_to_root();
+        return;
+    }
+    // Добавляем trailing slash
+    len = strlen(current_path);
+    if (len > 1 && current_path[len - 1] != '/') {
+        current_path[len] = '/';
+        current_path[len + 1] = '\0';
+    }
+}
+
+// Вход в папку
+static void enter_dir(const char* dir_name) {
+    size_t len = strlen(current_path);
+    if (len > 1 && current_path[len - 1] != '/') {
+        current_path[len] = '/';
+        current_path[len + 1] = '\0';
+        len++;
+    }
+    strncat(current_path, dir_name, MAX_PATH - strlen(current_path) - 1);
+    len = strlen(current_path);
+    if (current_path[len - 1] != '/') {
+        current_path[len] = '/';
+        current_path[len + 1] = '\0';
+    }
+}
+
+// --- Открытие/закрытие ---
 
 void file_explorer_open(lv_obj_t* parent) {
     parent_ref = parent;
@@ -430,7 +519,7 @@ void file_explorer_open(lv_obj_t* parent) {
     lv_obj_set_style_text_font(hint_label, &lv_font_cyr_10, 0);
     lv_obj_align(hint_label, LV_ALIGN_BOTTOM_MID, 0, -2);
 
-    strncpy(current_path, "/", MAX_PATH - 1);
+    reset_to_root();
     scan_directory();
     update_display();
 }
@@ -456,7 +545,7 @@ void file_explorer_button(int button_id, int event) {
         if (button_id == BTN_ID_LEFT || button_id == BTN_ID_RIGHT) {
             current_src = (current_src == SRC_INTERNAL) ? SRC_SD : SRC_INTERNAL;
             picking_source = false;
-            strncpy(current_path, "/", MAX_PATH - 1);
+            reset_to_root();
             cleanup_items();
             scan_directory();
             update_display();
@@ -465,7 +554,7 @@ void file_explorer_button(int button_id, int event) {
                              (current_src == SRC_SD && sd_mounted);
             if (available) {
                 picking_source = false;
-                strncpy(current_path, "/", MAX_PATH - 1);
+                reset_to_root();
                 cleanup_items();
                 scan_directory();
                 update_display();
@@ -487,25 +576,11 @@ void file_explorer_button(int button_id, int event) {
             update_display();
         }
     } else if (button_id == BTN_ID_LEFT) {
-        if (strcmp(current_path, "/") == 0) {
+        if (is_at_root()) {
             picking_source = true;
             update_display();
         } else {
-            // Go up: trim trailing slash, then trim last component
-            size_t len = strlen(current_path);
-            if (len > 1 && current_path[len - 1] == '/') {
-                current_path[len - 1] = '\0';
-                len--;
-            }
-            char* last_slash = strrchr(current_path, '/');
-            if (last_slash && last_slash != current_path) *last_slash = '\0';
-            else { current_path[0] = '/'; current_path[1] = '\0'; }
-            // Ensure trailing slash
-            len = strlen(current_path);
-            if (len > 1 && current_path[len - 1] != '/') {
-                current_path[len] = '/';
-                current_path[len + 1] = '\0';
-            }
+            go_up();
             cleanup_items();
             scan_directory();
             update_display();
@@ -515,47 +590,19 @@ void file_explorer_button(int button_id, int event) {
         FileEntry* e = &entries[selected_idx];
 
         if (strcmp(e->name, "..") == 0) {
-            size_t len = strlen(current_path);
-            if (len > 1 && current_path[len - 1] == '/') {
-                current_path[len - 1] = '\0';
-                len--;
-            }
-            char* last_slash = strrchr(current_path, '/');
-            if (last_slash && last_slash != current_path) *last_slash = '\0';
-            else { current_path[0] = '/'; current_path[1] = '\0'; }
-            // Ensure trailing slash
-            len = strlen(current_path);
-            if (len > 1 && current_path[len - 1] != '/') {
-                current_path[len] = '/';
-                current_path[len + 1] = '\0';
-            }
+            go_up();
             cleanup_items();
             scan_directory();
             update_display();
         } else if (e->is_dir) {
-            // Enter directory: ensure trailing slash, append name, ensure trailing slash
-            size_t len = strlen(current_path);
-            if (len > 1 && current_path[len - 1] != '/') {
-                current_path[len] = '/';
-                current_path[len + 1] = '\0';
-                len++;
-            }
-            strncat(current_path, e->name, MAX_PATH - strlen(current_path) - 1);
-            len = strlen(current_path);
-            if (current_path[len - 1] != '/') {
-                current_path[len] = '/';
-                current_path[len + 1] = '\0';
-            }
+            enter_dir(e->name);
             cleanup_items();
             scan_directory();
             update_display();
         } else {
+            // Открытие файла — строим полный путь
             char fullpath[MAX_PATH];
-            size_t plen = strlen(current_path);
-            if (plen > 1 && current_path[plen - 1] != '/')
-                snprintf(fullpath, sizeof(fullpath), "%s/%s", current_path, e->name);
-            else
-                snprintf(fullpath, sizeof(fullpath), "%s%s", current_path, e->name);
+            build_entry_path(fullpath, sizeof(fullpath), e->name);
             open_file(fullpath, e->name);
         }
     }
