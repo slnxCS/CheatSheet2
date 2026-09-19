@@ -75,10 +75,10 @@ static void refresh_cb(lv_timer_t* timer) {
         return;
     }
 
-    // Preview: QUARTER scale of 1600x1200 = 400x300
+    // Preview: EIGHTH scale of 1600x1200 = 200x150 (быстро)
     int dec_w = 0, dec_h = 0;
     if (jpeg_decode_to_rgb565(jpeg_buf, jpeg_len,
-                              temp_buf, 400, 300, 400 * 2, 4,
+                              temp_buf, 200, 150, 200 * 2, 8,
                               &dec_w, &dec_h)) {
         if (dec_w > 0 && dec_h > 0) {
             scale_image((uint16_t*)temp_buf, dec_w, dec_h,
@@ -174,8 +174,8 @@ void camera_app_open(lv_obj_t* parent) {
         return;
     }
 
-    // Pre-allocate temp decode buffer for QUARTER of UXGA (400x300)
-    temp_buf = (uint8_t*)ps_malloc(400 * 300 * 2);
+    // Pre-allocate temp decode buffer for EIGHTH of UXGA (200x150)
+    temp_buf = (uint8_t*)ps_malloc(200 * 150 * 2);
     if (!temp_buf) {
         lv_label_set_text_fmt(lbl_status, "%s %s",
                               LV_SYMBOL_WARNING, "No PSRAM");
@@ -246,10 +246,10 @@ void camera_app_button(int button_id, int event) {
             return;
         }
 
-        // Показать захват на экране (QUARTER scale)
+        // Показать захват на экране (EIGHTH scale)
         int dec_w = 0, dec_h = 0;
         if (jpeg_decode_to_rgb565(jpeg_buf, jpeg_len,
-                                  temp_buf, 400, 300, 400 * 2, 4,
+                                  temp_buf, 200, 150, 200 * 2, 8,
                                   &dec_w, &dec_h)) {
             if (dec_w > 0 && dec_h > 0) {
                 scale_image((uint16_t*)temp_buf, dec_w, dec_h,
@@ -303,22 +303,20 @@ void camera_app_button(int button_id, int event) {
     } else if (button_id == BTN_ID_RIGHT) {
         // Фокус — ближе (increase value)
         if (cam_focus < 1023) {
-            cam_focus += 32;
+            cam_focus += 64;
             if (cam_focus > 1023) cam_focus = 1023;
             camera_set_focus(cam_focus);
-            if (lbl_status)
-                lv_label_set_text_fmt(lbl_status, "B:%d F:%d",
-                                      cam_brightness, cam_focus);
+            lv_label_set_text_fmt(lbl_status, "B:%d F:%d",
+                                  cam_brightness, cam_focus);
         }
     } else if (button_id == BTN_ID_LEFT) {
         // Фокус — дальше (decrease value)
         if (cam_focus > 0) {
-            cam_focus -= 32;
+            cam_focus -= 64;
             if (cam_focus < 0) cam_focus = 0;
             camera_set_focus(cam_focus);
-            if (lbl_status)
-                lv_label_set_text_fmt(lbl_status, "B:%d F:%d",
-                                      cam_brightness, cam_focus);
+            lv_label_set_text_fmt(lbl_status, "B:%d F:%d",
+                                  cam_brightness, cam_focus);
         }
     }
 }
