@@ -7,6 +7,7 @@
 #include <LittleFS.h>
 #include <SD_MMC.h>
 #include <cstring>
+#include <vector>
 
 #define MAX_PATH 128
 #define MAX_ENTRIES 32
@@ -20,7 +21,7 @@ struct FileEntry {
     uint32_t size;
 };
 
-enum DataSource { SRC_INTERNAL, SRC_SD, SRC_COUNT };
+enum DataSource { SRC_INTERNAL, SRC_SD };
 enum ViewerMode { VIEW_NONE, VIEW_TEXT, VIEW_IMAGE };
 
 static lv_obj_t* parent_ref = nullptr;
@@ -36,7 +37,7 @@ static lv_obj_t* item_icons[VISIBLE_ITEMS] = {nullptr};
 static lv_obj_t* item_names[VISIBLE_ITEMS] = {nullptr};
 static lv_obj_t* item_info[VISIBLE_ITEMS] = {nullptr};
 
-static char current_path[MAX_PATH] = "/";
+static String current_path = String("/");
 static DataSource current_src = SRC_INTERNAL;
 static FileEntry entries[MAX_ENTRIES];
 static int entry_count = 0;
@@ -55,35 +56,31 @@ static lv_fs_path_ex_t img_mempath;
 
 // Корень FS: LittleFS = "/", SD_MMC = "/sdcard"
 static const char* get_root_path() {
-    return (current_src == SRC_SD) ? "/sdcard" : "/";
+    //return (current_src == SRC_SD) ? "/sdcard" : "/";
+    return "/";
 }
 
+#define is_at_root() (current_path == get_root_path())
+
 // Проверка: текущий путь — корень?
-static bool is_at_root() {
-    const char* root = get_root_path();
-    size_t root_len = strlen(root);
-    if (strlen(current_path) < root_len) return false;
-    return (strncmp(current_path, root, root_len) == 0 &&
-            (current_path[root_len] == '\0' || current_path[root_len] == '/'));
-}
+//static bool is_at_root() {
+//    //const char* root = get_root_path();
+//    //size_t root_len = strlen(root);
+//    //if (strlen(current_path) < root_len) return false;
+//    //return (strncmp(current_path, root, root_len) == 0 &&
+//    //        (current_path[root_len] == '\0' || current_path[root_len] == '/'));
+//
+//    return current_path == get_root_path();
+//}
 
 // Установить путь в корень
 static void reset_to_root() {
-    strncpy(current_path, get_root_path(), MAX_PATH - 1);
-    size_t len = strlen(current_path);
-    if (len > 1 && current_path[len - 1] != '/') {
-        current_path[len] = '/';
-        current_path[len + 1] = '\0';
-    }
+    current_path = "/";
 }
 
 // Построить полный путь из current_path + имя entry
-static void build_entry_path(char* out, size_t out_size, const char* entry_name) {
-    size_t plen = strlen(current_path);
-    if (plen > 1 && current_path[plen - 1] != '/')
-        snprintf(out, out_size, "%s/%s", current_path, entry_name);
-    else
-        snprintf(out, out_size, "%s%s", current_path, entry_name);
+static String build_entry_path(const char* entry_name) {
+    return current_path + entry_name;
 }
 
 // --- Файловые функции ---
@@ -132,7 +129,7 @@ static void format_size(uint32_t size, char* buf, size_t len) {
 }
 
 // Подсчёт файлов в папке (принимает ПОЛНЫЙ путь)
-static void count_dir_items(const char* fullpath, DataSource src, int* out_count) {
+static void count_dir_items(String fullpath, DataSource src, int* out_count) {
     int count = 0;
     File dir;
     if (src == SRC_INTERNAL) dir = LittleFS.open(fullpath, "r");
@@ -149,42 +146,32 @@ static void scan_directory() {
     entry_count = 0;
     selected_idx = 0;
     scroll_offset = 0;
-    if (current_src == SRC_INTERNAL && !littlefs_mounted) return;
-    if (current_src == SRC_SD && !sd_mounted) return;
+    
+    FS* selected_fs;
 
-    File dir;
-    if (current_src == SRC_INTERNAL) dir = LittleFS.open(current_path, "r");
-    else dir = SD_MMC.open(current_path, "r");
+    switch (current_src)
+    {
+        case SRC_INTERNAL : 
+            selected_fs = &LittleFS;
+        break;
 
-    if (!dir || !dir.isDirectory()) return;
+        case SRC_SD :
+            selected_fs = &SD_MMC;
+        break;
 
-    // Добавить ".." если не в корне
-    if (!is_at_root()) {
-        strncpy(entries[0].name, "..", MAX_NAME - 1);
-        entries[0].is_dir = true;
-        entries[0].size = 0;
-        entry_count = 1;
+        default:
+            Serial.printf("[Explorer] : Unknown src %d\n", (uint16_t)current_src);
+        break;
     }
 
-    for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
-        const char* name = f.name();
-        const char* base = strrchr(name, '/');
-        if (base) base++;
-        else base = name;
+    File dir = selected_fs->open(current_path, FILE_READ);
 
-        // Пропускаем записи с именем точки монтирования
-        if (strcmp(base, "sdcard") == 0 || strcmp(base, "littlefs") == 0) {
-            continue;
-        }
-
-        if (base[0] == '.' && strcmp(base, "..") != 0) continue;
-
-        strncpy(entries[entry_count].name, base, MAX_NAME - 1);
-        entries[entry_count].name[MAX_NAME - 1] = '\0';
+    for (File f = dir.openNextFile(); f && entry_count < MAX_ENTRIES; f = dir.openNextFile(), entry_count++) {
         entries[entry_count].is_dir = f.isDirectory();
         entries[entry_count].size = f.size();
-        entry_count++;
+        strncpy(entries[entry_count].name, f.name(), MAX_NAME);
     }
+
     dir.close();
 }
 
@@ -233,8 +220,7 @@ static void update_display() {
         // Подсчёт файлов в папке — нужен ПОЛНЫЙ путь
         char info[20] = "";
         if (entries[i].is_dir && strcmp(entries[i].name, "..") != 0) {
-            char dirpath[MAX_PATH];
-            build_entry_path(dirpath, sizeof(dirpath), entries[i].name);
+            String dirpath = build_entry_path(entries[i].name);
             int cnt = 0;
             count_dir_items(dirpath, current_src, &cnt);
             snprintf(info, sizeof(info), "%d", cnt);
@@ -301,7 +287,7 @@ static void close_viewer() {
     viewer_mode = VIEW_NONE;
 }
 
-static void open_text_viewer(const char* filepath, const char* filename) {
+static void open_text_viewer(String filepath, const char* filename) {
     File f;
     if (current_src == SRC_INTERNAL) f = LittleFS.open(filepath, "r");
     else f = SD_MMC.open(filepath, "r");
@@ -358,7 +344,7 @@ static void open_text_viewer(const char* filepath, const char* filename) {
     }
 }
 
-static void open_image_viewer(const char* filepath, const char* filename) {
+static void open_image_viewer(String filepath, const char* filename) {
     File f;
     if (current_src == SRC_INTERNAL) f = LittleFS.open(filepath, "r");
     else f = SD_MMC.open(filepath, "r");
@@ -407,7 +393,7 @@ static void open_image_viewer(const char* filepath, const char* filename) {
     }
 }
 
-static void open_file(const char* filepath, const char* filename) {
+static void open_file(String filepath, const char* filename) {
     if (is_text_file(filename)) {
         open_text_viewer(filepath, filename);
     } else if (is_image_file(filename)) {
@@ -415,47 +401,80 @@ static void open_file(const char* filepath, const char* filename) {
     }
 }
 
+static FS* get_current_FS() {
+    switch (current_src)
+    {
+        case SRC_SD :
+            return &SD_MMC;
+        case SRC_INTERNAL :
+            return &LittleFS;
+        default:
+            Serial.printf("Unknown file system: %d\n", (uint8_t)current_src);
+            return &LittleFS;
+    }
+}
+
+static bool is_dir_fp(const char* full_path, FS* fs) {
+    File f = fs->open(full_path, FILE_READ);
+    bool is_dir = f.isDirectory();
+    f.close();
+
+    return is_dir;
+}
+
+static void delete_file(String file_name, FS* fs = nullptr) {
+    if (fs == nullptr) fs = get_current_FS();
+
+    File root = fs->open(file_name, FILE_READ);
+    bool is_dir = root.isDirectory();
+    if (root.isDirectory()) {
+        std::vector<String> paths;
+
+        File f = root.openNextFile();
+        while (f) {
+            paths.push_back(f.path());
+            f.close();
+            f = root.openNextFile();
+        }
+        root.close();
+        
+        for (auto path : paths) {
+            delete_file(path, fs);
+        }
+
+        fs->rmdir(file_name);
+    }
+    else {
+        root.close();
+        fs->remove(file_name);
+    }
+}
+
 // --- Навигация ---
 
 // Подъём на уровень вверх
 static void go_up() {
-    size_t len = strlen(current_path);
-    // Убираем trailing slash
-    if (len > 1 && current_path[len - 1] == '/') {
-        current_path[len - 1] = '\0';
-        len--;
+    current_path = current_path.substring(0, current_path.lastIndexOf('/'));
+    if (current_path.length() == 0) current_path = "/";
+}
+
+void print_all_entries(const char* dir_name, FS& fs) {
+    File dir = fs.open(String(current_path) + String(dir_name));
+
+    int index = 0;
+
+    for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
+        Serial.printf("%d. %s\n", index, f.name());
+        index++;
     }
-    // Ищем последний /
-    char* last_slash = strrchr(current_path, '/');
-    if (last_slash && last_slash != current_path)
-        *last_slash = '\0';
-    else {
-        // Дошли до корня — сбрасываем
-        reset_to_root();
-        return;
-    }
-    // Добавляем trailing slash
-    len = strlen(current_path);
-    if (len > 1 && current_path[len - 1] != '/') {
-        current_path[len] = '/';
-        current_path[len + 1] = '\0';
-    }
+
+    dir.close();
 }
 
 // Вход в папку
 static void enter_dir(const char* dir_name) {
-    size_t len = strlen(current_path);
-    if (len > 1 && current_path[len - 1] != '/') {
-        current_path[len] = '/';
-        current_path[len + 1] = '\0';
-        len++;
-    }
-    strncat(current_path, dir_name, MAX_PATH - strlen(current_path) - 1);
-    len = strlen(current_path);
-    if (current_path[len - 1] != '/') {
-        current_path[len] = '/';
-        current_path[len + 1] = '\0';
-    }
+    if (!is_at_root()) current_path += "/";
+    current_path += dir_name;
 }
 
 // --- Открытие/закрытие ---
@@ -474,10 +493,6 @@ void file_explorer_open(lv_obj_t* parent) {
     memset(item_icons, 0, sizeof(item_icons));
     memset(item_names, 0, sizeof(item_names));
     memset(item_info, 0, sizeof(item_info));
-
-    littlefs_mounted = LittleFS.begin(true);
-    SD_MMC.setPins(39, 38, 40);
-    sd_mounted = SD_MMC.begin("/sdcard", true, false, 20000);
 
     lv_obj_set_style_bg_color(parent, lv_color_hex(0x0A1628), 0);
 
@@ -588,7 +603,11 @@ void file_explorer_button(int button_id, int event) {
             scan_directory();
             update_display();
         }
-    } else if (button_id == BTN_ID_RIGHT || button_id == BTN_ID_OK) {
+    } 
+    else if (button_id == BTN_ID_RIGHT) {
+        delete_file(current_path + entries[selected_idx].name);
+    }
+    else if (button_id == BTN_ID_OK) {
         if (entry_count == 0) return;
         FileEntry* e = &entries[selected_idx];
 
@@ -604,8 +623,7 @@ void file_explorer_button(int button_id, int event) {
             update_display();
         } else {
             // Открытие файла — строим полный путь
-            char fullpath[MAX_PATH];
-            build_entry_path(fullpath, sizeof(fullpath), e->name);
+            String fullpath = build_entry_path(e->name);
             open_file(fullpath, e->name);
         }
     }

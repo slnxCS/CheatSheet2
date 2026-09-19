@@ -12,9 +12,18 @@
 #include "services/lang_service.h"
 #include "services/storage_service.h"
 #include "ui/theme.h"
+#include "SD_MMC.h"
+#include "LittleFS.h"
 
 static bool in_app = false;
 static int current_app_idx = -1;
+
+static void init_fs() {
+    storage_set_constrain(LittleFS.begin(true) ? 0 : -1);
+
+    SD_MMC.setPins(39,38,40);
+    storage_set_constrain(SD_MMC.begin("/sdcard", true) ? 1 : 0);
+}
 
 static void on_button(ButtonId id, ButtonEvent event) {
     if (in_app) {
@@ -120,6 +129,8 @@ void setup() {
     Serial.println("[5/6] Apps registered on home");
 
     Serial.println("[6/6] Boot complete!");
+
+    init_fs();
 }
 
 static unsigned long last_tick = 0;

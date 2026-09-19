@@ -34,41 +34,6 @@ static bool fs_ready = false;
 
 static bool sd_ready = false;
 
-static void ensure_fs() {
-    if (storage_get() == 0) {
-        // Flash (LittleFS)
-        if (fs_ready) return;
-        if (!LittleFS.begin(true)) {
-            Serial.println("LittleFS mount failed, formatting...");
-            LittleFS.format();
-            if (!LittleFS.begin(true)) {
-                Serial.println("LittleFS format+mount failed");
-                return;
-            }
-        }
-        if (!LittleFS.exists("/images")) {
-            LittleFS.mkdir("/images");
-        }
-        fs_ready = true;
-        Serial.printf("LittleFS OK, total=%u, used=%u\n",
-                      (unsigned)LittleFS.totalBytes(), (unsigned)LittleFS.usedBytes());
-    } else {
-        // SD Card
-        if (sd_ready) return;
-        SD_MMC.setPins(39, 38, 40);
-        if (!SD_MMC.begin("/sdcard", true, false, 20000)) {
-            Serial.println("SD mount failed");
-            return;
-        }
-        if (!SD_MMC.exists("/images")) {
-            SD_MMC.mkdir("/images");
-        }
-        sd_ready = true;
-        Serial.printf("SD OK, total=%llu, used=%llu\n",
-                      SD_MMC.totalBytes(), SD_MMC.usedBytes());
-    }
-}
-
 // Rotate -90° + mirror + scale: src(src_w×src_h) → dst(dst_w×dst_h)
 static void rotate_scale(const uint16_t* src, int src_w, int src_h,
                           uint16_t* dst, int dst_w, int dst_h, uint32_t dst_stride) {
@@ -126,60 +91,47 @@ static void refresh_cb(lv_timer_t* timer) {
 }
 
 static bool save_photo(const uint8_t* jpeg_data, size_t jpeg_len) {
-    ensure_fs();
+    FS* fs;
+    size_t free_bytes;
+
+    switch (storage_get())
+    {
+        case 0:
+            fs = &LittleFS;
+            free_bytes = LittleFS.totalBytes() - LittleFS.usedBytes();
+        break;
+
+        case 1:
+            fs = &SD_MMC;
+            free_bytes = SD_MMC.totalBytes() - SD_MMC.usedBytes();
+        break;
+    }
+
     if (!fs_ready) return false;
 
-    if (storage_get() == 0) {
-        // Flash (LittleFS)
-        size_t free_bytes = LittleFS.totalBytes() - LittleFS.usedBytes();
-        if (free_bytes < jpeg_len + 4096) {
-            Serial.printf("LittleFS: not enough space (%u free, need %u)\n",
-                          (unsigned)free_bytes, (unsigned)jpeg_len);
-            return false;
-        }
+    
 
-        time_t now = time(nullptr);
-        struct tm* t = localtime(&now);
-
-        char path[64];
-        snprintf(path, sizeof(path), "/images/%04d%02d%02d_%02d%02d%02d.jpg",
-                 t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
-                 t->tm_hour, t->tm_min, t->tm_sec);
-
-        File f = LittleFS.open(path, FILE_WRITE);
-        if (!f) return false;
-
-        size_t written = f.write(jpeg_data, jpeg_len);
-        f.close();
-        Serial.printf("Saved %s (%u bytes)\n", path, (unsigned)written);
-        return written == jpeg_len;
-    } else {
-        // SD Card
-        if (!sd_ready) return false;
-
-        uint64_t free_bytes = SD_MMC.totalBytes() - SD_MMC.usedBytes();
-        if (free_bytes < jpeg_len + 4096) {
-            Serial.printf("SD: not enough space (%llu free, need %u)\n",
-                          free_bytes, (unsigned)jpeg_len);
-            return false;
-        }
-
-        time_t now = time(nullptr);
-        struct tm* t = localtime(&now);
-
-        char path[64];
-        snprintf(path, sizeof(path), "/images/%04d%02d%02d_%02d%02d%02d.jpg",
-                 t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
-                 t->tm_hour, t->tm_min, t->tm_sec);
-
-        File f = SD_MMC.open(path, FILE_WRITE);
-        if (!f) return false;
-
-        size_t written = f.write(jpeg_data, jpeg_len);
-        f.close();
-        Serial.printf("Saved %s (%u bytes)\n", path, (unsigned)written);
-        return written == jpeg_len;
+    if (free_bytes < jpeg_len + 4096) {
+        Serial.printf("not enough space (%u free, need %u)\n",
+                      (unsigned)free_bytes, (unsigned)jpeg_len);
+        return false;
     }
+
+    time_t now = time(nullptr);
+    struct tm* t = localtime(&now);
+    char path[64];
+    snprintf(path, sizeof(path), "/images/%04d%02d%02d_%02d%02d%02d.jpg",
+             t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
+             t->tm_hour, t->tm_min, t->tm_sec);
+
+    File f = fs->open(path, FILE_WRITE);
+    if (!f) return false;
+    size_t written = f.write(jpeg_data, jpeg_len);
+    f.close();
+
+    Serial.printf("Saved %s (%u bytes)\n", path, (unsigned)written);
+
+    return written == jpeg_len;
 }
 
 void camera_app_open(lv_obj_t* parent) {
@@ -243,8 +195,6 @@ void camera_app_open(lv_obj_t* parent) {
     canvas = lv_canvas_create(parent);
     lv_canvas_set_buffer(canvas, canvas_buf, IMG_W, IMG_H, LV_COLOR_FORMAT_RGB565);
     lv_obj_align(canvas, LV_ALIGN_TOP_MID, 0, HEADER_H + 2);
-
-    ensure_fs();
 
     preview_active = true;
     lv_label_set_text_fmt(lbl_status, "%s %s",
