@@ -89,6 +89,9 @@ bool camera_capture(uint8_t** buf, size_t* len) {
         Serial.println("Camera capture failed");
         return false;
     }
+
+    *buf = current_fb->buf;
+    *len = current_fb->len;
     return true;
 }
 
