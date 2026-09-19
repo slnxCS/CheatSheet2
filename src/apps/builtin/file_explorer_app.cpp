@@ -172,9 +172,8 @@ static void scan_directory() {
         if (base) base++;
         else base = name;
 
-        // Пропускаем записи с именем точки монтирования (sdcard, littlefs)
-        if ((current_src == SRC_SD && strcmp(base, "sdcard") == 0) ||
-            (current_src == SRC_INTERNAL && strcmp(base, "littlefs") == 0)) {
+        // Пропускаем записи с именем точки монтирования
+        if (strcmp(base, "sdcard") == 0 || strcmp(base, "littlefs") == 0) {
             continue;
         }
 
