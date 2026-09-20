@@ -13,7 +13,6 @@ static lv_obj_t* app_labels[APP_GRID_COLS * APP_GRID_ROWS] = {nullptr};
 static lv_obj_t* app_bgs[APP_GRID_COLS * APP_GRID_ROWS] = {nullptr};
 static lv_obj_t* app_glare[APP_GRID_COLS * APP_GRID_ROWS] = {nullptr};
 static lv_obj_t* page_dots = nullptr;
-static lv_obj_t* lbl_battery = nullptr;
 static lv_timer_t* bat_timer = nullptr;
 
 static AppEntry apps[APP_GRID_COLS * APP_GRID_ROWS];
@@ -95,15 +94,53 @@ static void update_selection() {
     }
 }
 
-static void update_battery_label() {
-    if (!lbl_battery) return;
+// --- Battery icon (нарисована примитивами, не из шрифта) ---
+static lv_obj_t* bat_container = nullptr;
+static lv_obj_t* bat_fill = nullptr;
+static lv_obj_t* bat_pct = nullptr;
 
-    if (battery_is_usb_connected()) {
-        lv_label_set_text(lbl_battery, "USB");
-        lv_obj_set_style_text_color(lbl_battery, lv_color_hex(0x4CAF50), 0);
+static void update_battery_label() {
+    if (!bat_container) return;
+
+    int pct = battery_get_percent();
+    bool usb = battery_is_usb_connected();
+
+    lv_color_t col;
+    if (usb) {
+        col = lv_color_hex(0x4CAF50);
+    } else if (pct < 0) {
+        col = lv_color_hex(0x9E9E9E);
+    } else if (pct > 50) {
+        col = lv_color_hex(0x4CAF50);
+    } else if (pct > 20) {
+        col = lv_color_hex(0xFF9800);
     } else {
-        lv_label_set_text(lbl_battery, "BATT");
-        lv_obj_set_style_text_color(lbl_battery, lv_color_hex(0xFF9800), 0);
+        col = lv_color_hex(0xF44336);
+    }
+
+    // Обновить полоску заряда
+    if (bat_fill) {
+        int fill_w = 0;
+        if (usb) {
+            fill_w = 16;  // полная при USB
+        } else if (pct >= 0) {
+            fill_w = (pct * 16) / 100;
+        }
+        if (fill_w < 1 && !usb) fill_w = 0;
+        lv_obj_set_size(bat_fill, fill_w, 8);
+        lv_obj_set_style_bg_color(bat_fill, col, 0);
+    }
+
+    // Обновить текст процента
+    if (bat_pct) {
+        lv_obj_set_style_text_color(bat_pct, col, 0);
+        if (usb) {
+            lv_label_set_text(bat_pct, "USB");
+        } else if (pct >= 0) {
+            lv_label_set_text_fmt(bat_pct, "%d%%", pct);
+        } else {
+            lv_label_set_text(bat_pct, "???");
+        }
     }
 }
 
@@ -208,10 +245,34 @@ void home_screen_create(lv_obj_t* parent) {
     lv_obj_set_style_pad_all(home_obj, 0, 0);
     lv_obj_set_style_radius(home_obj, 0, 0);
 
-    // Battery label — в шапке справа (без отдельной панели)
-    lbl_battery = lv_label_create(home_obj);
-    lv_obj_set_style_text_font(lbl_battery, &lv_font_cyr_10, 0);
-    lv_obj_align(lbl_battery, LV_ALIGN_TOP_RIGHT, -4, 4);
+    // --- Battery icon in header ---
+    // Контейнер: корпус батареи (рамка + наконечник)
+    bat_container = lv_obj_create(home_obj);
+    lv_obj_set_size(bat_container, 22, 12);   // корпус + наконечник
+    lv_obj_set_style_bg_color(bat_container, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_opa(bat_container, LV_OPA_30, 0);
+    lv_obj_set_style_border_width(bat_container, 1, 0);
+    lv_obj_set_style_border_color(bat_container, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_border_opa(bat_container, LV_OPA_50, 0);
+    lv_obj_set_style_radius(bat_container, 2, 0);
+    lv_obj_set_style_pad_all(bat_container, 1, 0);
+    lv_obj_align(bat_container, LV_ALIGN_TOP_RIGHT, -40, 3);
+
+    // Полоска заряда внутри корпуса
+    bat_fill = lv_obj_create(bat_container);
+    lv_obj_set_size(bat_fill, 16, 8);
+    lv_obj_set_style_bg_color(bat_fill, lv_color_hex(0x4CAF50), 0);
+    lv_obj_set_style_bg_opa(bat_fill, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(bat_fill, 0, 0);
+    lv_obj_set_style_radius(bat_fill, 1, 0);
+    lv_obj_set_style_pad_all(bat_fill, 0, 0);
+    lv_obj_align(bat_fill, LV_ALIGN_LEFT_MID, 0, 0);
+
+    // Процент рядом с иконкой
+    bat_pct = lv_label_create(home_obj);
+    lv_obj_set_style_text_font(bat_pct, &lv_font_cyr_10, 0);
+    lv_obj_align(bat_pct, LV_ALIGN_TOP_RIGHT, -4, 3);
+
     update_battery_label();
 
     // Timer: обновлять каждые 5 секунд

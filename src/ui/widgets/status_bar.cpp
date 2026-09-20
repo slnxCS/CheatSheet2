@@ -25,7 +25,7 @@ void status_bar_create(lv_obj_t* parent) {
     lv_obj_set_style_text_font(lbl_wifi, &lv_font_cyr_14, 0);
 
     lbl_time = lv_label_create(bar_obj);
-    lv_label_set_text(lbl_time, "--:--");
+    lv_label_set_text(lbl_time, "");
     lv_obj_set_style_text_color(lbl_time, theme_color_text(), 0);
     lv_obj_set_style_text_font(lbl_time, &lv_font_cyr_12, 0);
 }
