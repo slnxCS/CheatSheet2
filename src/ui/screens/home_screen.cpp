@@ -102,6 +102,7 @@ static lv_obj_t* bat_pct = nullptr;
 static void update_battery_label() {
     if (!bat_container) return;
 
+    float v = battery_get_voltage();
     int pct = battery_get_percent();
     bool usb = battery_is_usb_connected();
 
@@ -118,20 +119,20 @@ static void update_battery_label() {
         col = lv_color_hex(0xF44336);
     }
 
-    // Обновить полоску заряда
+    // Полоска заряда
     if (bat_fill) {
         int fill_w = 0;
         if (usb) {
-            fill_w = 16;  // полная при USB
+            fill_w = 16;
         } else if (pct >= 0) {
             fill_w = (pct * 16) / 100;
+            if (fill_w < 1) fill_w = 1;
         }
-        if (fill_w < 1 && !usb) fill_w = 0;
         lv_obj_set_size(bat_fill, fill_w, 8);
         lv_obj_set_style_bg_color(bat_fill, col, 0);
     }
 
-    // Обновить текст процента
+    // Текст
     if (bat_pct) {
         lv_obj_set_style_text_color(bat_pct, col, 0);
         if (usb) {
@@ -139,7 +140,7 @@ static void update_battery_label() {
         } else if (pct >= 0) {
             lv_label_set_text_fmt(bat_pct, "%d%%", pct);
         } else {
-            lv_label_set_text(bat_pct, "???");
+            lv_label_set_text_fmt(bat_pct, "%.1fV", v);
         }
     }
 }
