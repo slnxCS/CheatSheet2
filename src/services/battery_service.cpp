@@ -17,7 +17,11 @@
 #define BAT_DIVIDER_RATIO  2.0f
 #endif
 
-#define BAT_CALIBRATION    1.00f
+// Калибровка: при Vbat=3.0V (мёртвый) показывало 20% (видело 3.48V)
+// Нужно: calibration = 3.0 / 3.48 = 0.86
+// Замерьте мультиметром Vbat и подстройте:
+//   калибровка = Vbat_мультиметр / Vbat_дисплей
+#define BAT_CALIBRATION    0.86f
 #define VBAT_FULL          4.20f
 #define VBAT_EMPTY         3.30f
 
