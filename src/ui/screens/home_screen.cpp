@@ -1,6 +1,7 @@
 #include "fonts/fonts.h"
 #include "ui/screens/home_screen.h"
 #include "ui/theme.h"
+#include "services/battery_service.h"
 #include <cstring>
 
 #define ICON_SIZE 50
@@ -12,6 +13,8 @@ static lv_obj_t* app_labels[APP_GRID_COLS * APP_GRID_ROWS] = {nullptr};
 static lv_obj_t* app_bgs[APP_GRID_COLS * APP_GRID_ROWS] = {nullptr};
 static lv_obj_t* app_glare[APP_GRID_COLS * APP_GRID_ROWS] = {nullptr};
 static lv_obj_t* page_dots = nullptr;
+static lv_obj_t* lbl_battery = nullptr;
+static lv_timer_t* bat_timer = nullptr;
 
 static AppEntry apps[APP_GRID_COLS * APP_GRID_ROWS];
 static int app_count = 0;
@@ -90,6 +93,22 @@ static void update_selection() {
         }
         lv_label_set_text(page_dots, dots);
     }
+}
+
+static void update_battery_label() {
+    if (!lbl_battery) return;
+
+    if (battery_is_usb_connected()) {
+        lv_label_set_text(lbl_battery, LV_SYMBOL_CHARGE " USB");
+        lv_obj_set_style_text_color(lbl_battery, lv_color_hex(0x4CAF50), 0);
+    } else {
+        lv_label_set_text(lbl_battery, LV_SYMBOL_BATTERY_FULL " BATT");
+        lv_obj_set_style_text_color(lbl_battery, lv_color_hex(0xFF9800), 0);
+    }
+}
+
+static void bat_timer_cb(lv_timer_t* t) {
+    update_battery_label();
 }
 
 static void create_icon_grid(lv_obj_t* parent) {
@@ -188,6 +207,25 @@ void home_screen_create(lv_obj_t* parent) {
     lv_obj_set_style_border_width(home_obj, 0, 0);
     lv_obj_set_style_pad_all(home_obj, 0, 0);
     lv_obj_set_style_radius(home_obj, 0, 0);
+
+    // Status bar at top
+    lv_obj_t* bar = lv_obj_create(home_obj);
+    lv_obj_set_size(bar, 320, 14);
+    lv_obj_set_style_bg_color(bar, theme_color_panel(), 0);
+    lv_obj_set_style_bg_opa(bar, LV_OPA_80, 0);
+    lv_obj_set_style_border_width(bar, 0, 0);
+    lv_obj_set_style_radius(bar, 0, 0);
+    lv_obj_set_style_pad_all(bar, 0, 0);
+    lv_obj_align(bar, LV_ALIGN_TOP_MID, 0, 0);
+
+    // Battery label (right side)
+    lbl_battery = lv_label_create(bar);
+    lv_obj_set_style_text_font(lbl_battery, &lv_font_cyr_10, 0);
+    lv_obj_align(lbl_battery, LV_ALIGN_RIGHT_MID, -4, 0);
+    update_battery_label();
+
+    // Timer: обновлять каждые 5 секунд
+    bat_timer = lv_timer_create(bat_timer_cb, 5000, nullptr);
 
     init_styles();
     create_icon_grid(home_obj);

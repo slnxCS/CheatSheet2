@@ -13,6 +13,7 @@
 #include "apps/builtin/game_2048.h"
 #include "services/lang_service.h"
 #include "services/storage_service.h"
+#include "services/battery_service.h"
 #include "ui/theme.h"
 #include "SD_MMC.h"
 #include "LittleFS.h"
@@ -109,6 +110,9 @@ void setup() {
     Serial.println("[2.6/6] Storage...");
     storage_init();
     Serial.printf("[2.6/6] Storage: %d\n", storage_get());
+
+    Serial.println("[2.7/6] Battery...");
+    battery_init();
 
     Serial.println("[3/6] Apps...");
     app_registry_init();
