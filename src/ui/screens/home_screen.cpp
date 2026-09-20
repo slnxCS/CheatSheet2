@@ -99,10 +99,10 @@ static void update_battery_label() {
     if (!lbl_battery) return;
 
     if (battery_is_usb_connected()) {
-        lv_label_set_text(lbl_battery, LV_SYMBOL_CHARGE " USB");
+        lv_label_set_text(lbl_battery, "USB");
         lv_obj_set_style_text_color(lbl_battery, lv_color_hex(0x4CAF50), 0);
     } else {
-        lv_label_set_text(lbl_battery, LV_SYMBOL_BATTERY_FULL " BATT");
+        lv_label_set_text(lbl_battery, "BATT");
         lv_obj_set_style_text_color(lbl_battery, lv_color_hex(0xFF9800), 0);
     }
 }
