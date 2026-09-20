@@ -9,6 +9,8 @@
 #include "apps/builtin/camera_app.h"
 #include "apps/builtin/settings_app.h"
 #include "apps/builtin/file_explorer_app.h"
+#include "apps/builtin/snake_game.h"
+#include "apps/builtin/game_2048.h"
 #include "services/lang_service.h"
 #include "services/storage_service.h"
 #include "ui/theme.h"
@@ -113,6 +115,8 @@ void setup() {
     app_registry_add(lang_str_app_camera(),  LV_SYMBOL_IMAGE,  camera_app_open,  camera_app_close, camera_app_button);
     app_registry_add(lang_str_app_settings(), LV_SYMBOL_SETTINGS, settings_app_open, settings_app_close, settings_app_button);
     app_registry_add(lang_str_app_explorer(), LV_SYMBOL_DIRECTORY, file_explorer_open, file_explorer_close, file_explorer_button);
+    app_registry_add("Snake", LV_SYMBOL_IMAGE, snake_game_open, snake_game_close, snake_game_button);
+    app_registry_add("2048", LV_SYMBOL_IMAGE, game_2048_open, game_2048_close, game_2048_button);
     Serial.printf("[3/6] Apps registered: %d\n", app_registry_count());
 
     Serial.println("[4/6] UI...");
