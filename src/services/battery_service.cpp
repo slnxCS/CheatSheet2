@@ -12,8 +12,8 @@
 // Решение: отключаем pull-up через регистр IO_MUX.
 // ============================================================
 
-#define BAT_GPIO          3
-#define BAT_PIN           ADC1_CHANNEL_2
+#define BAT_GPIO          0
+#define BAT_PIN           ADC1_CHANNEL_0
 
 // Регистр подтяжки GPIO3 на ESP32-S3
 // IO_MUX_REG = 0x3FF49000 + (GPIO * 4)
@@ -24,8 +24,10 @@
 // GPIO3 IO_MUX register = base + (3 * 4) = 0x3FF4900C
 // Bit 7: PU (pull-up enable)
 // Bit 8: PD (pull-down enable)
+// IO_MUX register: base 0x3FF49000 + GPIO*4
+// Bit 7: PU (pull-up)  Bit 8: PD (pull-down)
 #define IO_MUX_BASE_ADDR  0x3FF49000UL
-#define IO_MUX_GPIO3_ADDR (IO_MUX_BASE_ADDR + (BAT_GPIO * 4))
+#define IO_MUX_GPIO_ADDR  (IO_MUX_BASE_ADDR + (BAT_GPIO * 4))
 #define IO_MUX_PU_BIT     (1 << 7)
 #define IO_MUX_PD_BIT     (1 << 8)
 
@@ -49,7 +51,7 @@ static void disable_pullups() {
     gpio_set_pull_mode((gpio_num_t)BAT_GPIO, GPIO_FLOATING);
 
     // Принудительно отключаем PU и PD через регистр IO_MUX
-    volatile uint32_t* iomux = (volatile uint32_t*)IO_MUX_GPIO3_ADDR;
+    volatile uint32_t* iomux = (volatile uint32_t*)IO_MUX_GPIO_ADDR;
     uint32_t reg = *iomux;
     reg &= ~(IO_MUX_PU_BIT | IO_MUX_PD_BIT);
     *iomux = reg;
