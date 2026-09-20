@@ -37,6 +37,16 @@ void battery_init() {
                              ADC_WIDTH_BIT_12, 1100, &adc_chars);
 
     inited = true;
+
+    // adc1_config_width() ломает GPIO matrix для ВСЕХ ADC1 пинов (GPIO0-10).
+    // Восстанавливаем кнопки GPIO1 и GPIO2 (тоже на ADC1):
+    gpio_reset_pin((gpio_num_t)1);
+    gpio_set_direction((gpio_num_t)1, GPIO_MODE_INPUT);
+    gpio_set_pull_mode((gpio_num_t)1, GPIO_PULLUP_ONLY);
+    gpio_reset_pin((gpio_num_t)2);
+    gpio_set_direction((gpio_num_t)2, GPIO_MODE_INPUT);
+    gpio_set_pull_mode((gpio_num_t)2, GPIO_PULLUP_ONLY);
+
     battery_get_percent();
     Serial.printf("Battery: GPIO%d V=%.2fV %d%%\n",
                   BAT_GPIO, last_voltage, last_percent);
