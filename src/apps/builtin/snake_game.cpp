@@ -9,14 +9,16 @@
 // --- Grid ---
 #define CELL 12
 #define COLS 26
-#define ROWS 14
+#define ROWS 15
 #define MAX_SNAKE (COLS * ROWS)
 
-// Game area: 320 × (240-28-12) = 320 × 200
+// Canvas: 320 × 210 (полная высота под шапкой)
+// Сетка: 312 × 180, по центру
 #define GAME_W (COLS * CELL)   // 312
-#define GAME_H (ROWS * CELL)   // 168
+#define GAME_H (ROWS * CELL)   // 180
+#define CANVAS_H 210
 #define OFFSET_X ((320 - GAME_W) / 2)  // 4
-#define OFFSET_Y 42  // header(28) + gap(2) + status(12)
+#define OFFSET_Y ((CANVAS_H - GAME_H) / 2)  // 15
 
 // Colors (RGB565)
 #define COL_BG      0x0000  // black
@@ -115,8 +117,8 @@ static void reset_game() {
 }
 
 static void draw_game() {
-    // Clear game area
-    fill_rect(0, OFFSET_Y, 320, GAME_H, COL_BG);
+    // Clear canvas
+    fill_rect(0, 0, 320, CANVAS_H, COL_BG);
 
     // Grid dots
     for (int y = 0; y < ROWS; y++) {
@@ -240,14 +242,14 @@ void snake_game_open(lv_obj_t* parent) {
 
     // Canvas for game
     canvas_stride = lv_draw_buf_width_to_stride(320, LV_COLOR_FORMAT_RGB565);
-    size_t buf_size = canvas_stride * 200;
+    size_t buf_size = canvas_stride * CANVAS_H;
     canvas_buf = (uint8_t*)ps_malloc(buf_size);
     if (!canvas_buf) canvas_buf = (uint8_t*)malloc(buf_size);
     if (!canvas_buf) return;
     memset(canvas_buf, 0, buf_size);
 
     canvas_obj = lv_canvas_create(parent);
-    lv_canvas_set_buffer(canvas_obj, canvas_buf, 320, 200, LV_COLOR_FORMAT_RGB565);
+    lv_canvas_set_buffer(canvas_obj, canvas_buf, 320, CANVAS_H, LV_COLOR_FORMAT_RGB565);
     lv_obj_align(canvas_obj, LV_ALIGN_TOP_MID, 0, 30);
 
     // Info label
@@ -257,7 +259,7 @@ void snake_game_open(lv_obj_t* parent) {
     lv_obj_align(lbl_info, LV_ALIGN_BOTTOM_MID, 0, -2);
 
     // Show menu
-    fill_rect(0, OFFSET_Y, 320, GAME_H, COL_BG);
+    fill_rect(0, 0, 320, CANVAS_H, COL_BG);
 
     // Title text in center of game area
     lv_obj_t* menu_text = lv_label_create(parent);
