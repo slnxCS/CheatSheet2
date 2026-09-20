@@ -208,20 +208,10 @@ void home_screen_create(lv_obj_t* parent) {
     lv_obj_set_style_pad_all(home_obj, 0, 0);
     lv_obj_set_style_radius(home_obj, 0, 0);
 
-    // Status bar at top
-    lv_obj_t* bar = lv_obj_create(home_obj);
-    lv_obj_set_size(bar, 320, 14);
-    lv_obj_set_style_bg_color(bar, theme_color_panel(), 0);
-    lv_obj_set_style_bg_opa(bar, LV_OPA_80, 0);
-    lv_obj_set_style_border_width(bar, 0, 0);
-    lv_obj_set_style_radius(bar, 0, 0);
-    lv_obj_set_style_pad_all(bar, 0, 0);
-    lv_obj_align(bar, LV_ALIGN_TOP_MID, 0, 0);
-
-    // Battery label (right side)
-    lbl_battery = lv_label_create(bar);
+    // Battery label — в шапке справа (без отдельной панели)
+    lbl_battery = lv_label_create(home_obj);
     lv_obj_set_style_text_font(lbl_battery, &lv_font_cyr_10, 0);
-    lv_obj_align(lbl_battery, LV_ALIGN_RIGHT_MID, -4, 0);
+    lv_obj_align(lbl_battery, LV_ALIGN_TOP_RIGHT, -4, 4);
     update_battery_label();
 
     // Timer: обновлять каждые 5 секунд
