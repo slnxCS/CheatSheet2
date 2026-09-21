@@ -126,12 +126,34 @@ static bool save_photo(const uint8_t* jpeg_data, size_t jpeg_len) {
 
     File f = fs->open(path, FILE_WRITE);
     if (!f) return false;
-    size_t written = f.write(jpeg_data, jpeg_len);
+
+    // Write SOI marker
+    f.write((uint8_t*)"\xFF\xD8", 2);
+
+    // Write EXIF APP1 with orientation tag = 6 (90° CW)
+    // This makes viewers auto-rotate the photo to match preview
+    static const uint8_t exif_app1[] = {
+        0xFF, 0xE1,             // APP1 marker
+        0x00, 0x32,             // APP1 length (50 bytes)
+        0x45, 0x78, 0x69, 0x66, 0x00, 0x00,  // "Exif\0\0"
+        0x49, 0x49,             // TIFF byte order (little-endian)
+        0x00, 0x2A,             // TIFF magic (42)
+        0x08, 0x00, 0x00, 0x00,// IFD0 offset (8)
+        0x01, 0x00,             // IFD0 entry count (1)
+        0x01, 0x01,             // Tag: Orientation (0x0112)
+        0x00, 0x03,             // Type: SHORT (3)
+        0x00, 0x00, 0x00, 0x01,// Count: 1
+        0x00, 0x06, 0x00, 0x00 // Value: 6 (90° CW)
+    };
+    f.write(exif_app1, sizeof(exif_app1));
+
+    // Write JPEG data (skip SOI - first 2 bytes)
+    size_t written = f.write(jpeg_data + 2, jpeg_len - 2);
     f.close();
 
-    Serial.printf("Saved %s (%u bytes)\n", path, (unsigned)written);
+    Serial.printf("Saved %s (%u bytes + EXIF)\n", path, (unsigned)(written + sizeof(exif_app1) + 2));
 
-    return written == jpeg_len;
+    return written == (jpeg_len - 2);
 }
 
 void camera_app_open(lv_obj_t* parent) {

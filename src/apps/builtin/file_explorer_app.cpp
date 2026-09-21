@@ -398,6 +398,7 @@ static void open_image_viewer(String filepath, const char* filename) {
     lv_fs_make_path_from_buffer(&img_mempath, LV_FS_MEMFS_LETTER, img_data, img_data_size, "jpg");
     viewer_content = lv_img_create(viewer_obj);
     lv_img_set_src(viewer_content, &img_mempath);
+    lv_image_set_rotation(viewer_content, 900);  // 90° CW — как на предпросмотре камеры
     lv_obj_align(viewer_content, LV_ALIGN_CENTER, 0, 14);
 
     if (hint_label) {
