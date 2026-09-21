@@ -34,6 +34,8 @@ enum GameState { STATE_MENU, STATE_PLAYING, STATE_OVER };
 static lv_obj_t* parent_ref = nullptr;
 static lv_obj_t* canvas_obj = nullptr;
 static lv_obj_t* lbl_info = nullptr;
+static lv_obj_t* menu_text = nullptr;
+static lv_obj_t* hint = nullptr;
 static lv_timer_t* game_timer = nullptr;
 static uint8_t* canvas_buf = nullptr;
 static uint32_t canvas_stride = 0;
@@ -184,6 +186,8 @@ static void game_tick(lv_timer_t* t) {
     for (int i = 0; i < snake_len; i++) {
         if (snake[i].x == new_head.x && snake[i].y == new_head.y) {
             state = STATE_OVER;
+            lv_obj_set_hidden(lbl_info, false);
+                lv_obj_set_hidden(menu_text, false);
             if (score > high_score) high_score = score;
             update_info();
             return;
@@ -235,7 +239,7 @@ void snake_game_open(lv_obj_t* parent) {
     lv_obj_align(header, LV_ALIGN_TOP_MID, 0, 0);
 
     lv_obj_t* lbl_title = lv_label_create(header);
-    lv_label_set_text_fmt(lbl_title, "%s Snake", LV_SYMBOL_IMAGE);
+    lv_label_set_text_fmt(lbl_title, "%s Snake", LV_SYMBOL_DUMMY);
     lv_obj_set_style_text_color(lbl_title, theme_color_text(), 0);
     lv_obj_set_style_text_font(lbl_title, &lv_font_cyr_14, 0);
     lv_obj_align(lbl_title, LV_ALIGN_CENTER, 0, 0);
@@ -262,7 +266,7 @@ void snake_game_open(lv_obj_t* parent) {
     fill_rect(0, 0, 320, CANVAS_H, COL_BG);
 
     // Title text in center of game area
-    lv_obj_t* menu_text = lv_label_create(parent);
+    menu_text = lv_label_create(parent);
     lv_label_set_text(menu_text, LV_SYMBOL_PLAY "\nSnake");
     lv_obj_set_style_text_color(menu_text, lv_color_hex(0x07E0), 0);
     lv_obj_set_style_text_font(menu_text, &lv_font_cyr_20, 0);
@@ -298,6 +302,8 @@ void snake_game_button(int button_id, int event) {
 
     if (state == STATE_MENU) {
         if (button_id == BTN_ID_OK) {
+            lv_obj_set_hidden(lbl_info, true);
+            lv_obj_set_hidden(menu_text, true);
             reset_game();
             state = STATE_PLAYING;
             update_info();
@@ -314,6 +320,8 @@ void snake_game_button(int button_id, int event) {
             case BTN_ID_OK:
                 // Pause
                 lv_timer_pause(game_timer);
+                lv_obj_set_hidden(lbl_info, false);
+                lv_obj_set_hidden(menu_text, false);
                 state = STATE_MENU;
                 update_info();
                 break;
