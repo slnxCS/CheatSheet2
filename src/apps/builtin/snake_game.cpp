@@ -187,7 +187,8 @@ static void game_tick(lv_timer_t* t) {
         if (snake[i].x == new_head.x && snake[i].y == new_head.y) {
             state = STATE_OVER;
             lv_obj_set_hidden(lbl_info, false);
-                lv_obj_set_hidden(menu_text, false);
+            lv_obj_set_hidden(menu_text, false);
+            lv_obj_set_hidden(hint, false);
             if (score > high_score) high_score = score;
             update_info();
             return;
@@ -273,7 +274,7 @@ void snake_game_open(lv_obj_t* parent) {
     lv_obj_set_style_text_align(menu_text, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(menu_text, LV_ALIGN_CENTER, 0, 10);
 
-    lv_obj_t* hint = lv_label_create(parent);
+    hint = lv_label_create(parent);
     lv_label_set_text(hint, "OK");
     lv_obj_set_style_text_color(hint, theme_color_text_muted(), 0);
     lv_obj_set_style_text_font(hint, &lv_font_cyr_12, 0);
@@ -304,6 +305,7 @@ void snake_game_button(int button_id, int event) {
         if (button_id == BTN_ID_OK) {
             lv_obj_set_hidden(lbl_info, true);
             lv_obj_set_hidden(menu_text, true);
+            lv_obj_set_hidden(hint, true);
             reset_game();
             state = STATE_PLAYING;
             update_info();
@@ -322,6 +324,7 @@ void snake_game_button(int button_id, int event) {
                 lv_timer_pause(game_timer);
                 lv_obj_set_hidden(lbl_info, false);
                 lv_obj_set_hidden(menu_text, false);
+                lv_obj_set_hidden(hint, false);
                 state = STATE_MENU;
                 update_info();
                 break;
