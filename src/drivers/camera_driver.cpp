@@ -61,7 +61,7 @@ bool camera_init() {
 
     if (psramFound()) {
         config.frame_size = FRAMESIZE_UXGA;  // 1600x1200
-        config.jpeg_quality = 8;              // высокое качество (0-63)
+        config.jpeg_quality = 4;              // 0-63, меньше = качественнее: мелкий текст детальнее
         config.fb_count = 2;
         config.grab_mode = CAMERA_GRAB_LATEST;
         config.fb_location = CAMERA_FB_IN_PSRAM;
@@ -82,9 +82,9 @@ bool camera_init() {
     if (s) {
         s->set_brightness(s, 0);
         s->set_saturation(s, -1);
-        s->set_contrast(s, 1);
-        s->set_sharpness(s, 2);
-        s->set_denoise(s, 1);
+        s->set_contrast(s, 2);     // чётче разделение «чернила/бумага» (диапазон −3..3)
+        s->set_sharpness(s, 3);    // максимум (−3..3): резче края знаков для OCR
+        s->set_denoise(s, 1);      // минимальный шумоподавитель, не размывает мелкий шрифт
         s->set_awb_gain(s, 1);
         s->set_wb_mode(s, 0);
         s->set_exposure_ctrl(s, 1);

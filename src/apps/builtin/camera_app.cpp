@@ -148,13 +148,17 @@ static void refresh_cb(lv_timer_t* timer) {
 
 // --- JPEGENC: запись напрямую в открытый File ---
 static File* enc_file = nullptr;
+static bool enc_write_err = false;  // true, если диск переполнился в середине записи
 
 static void* enc_open_cb(const char* /*name*/) {
     return enc_file;  // File уже открыт до вызова JPEGENC::open()
 }
 static int32_t enc_write_cb(JPEGE_FILE* f, uint8_t* buf, int32_t len) {
     File* fp = (File*)f->fHandle;
-    return fp ? (int32_t)fp->write(buf, (size_t)len) : 0;
+    if (!fp) { enc_write_err = true; return 0; }
+    int32_t written = (int32_t)fp->write(buf, (size_t)len);
+    if (written != len) enc_write_err = true;  // короткая запись = нет места
+    return written;
 }
 static int32_t enc_read_cb(JPEGE_FILE*, uint8_t*, int32_t) {
     return 0;  // при кодировании не читаем
@@ -188,8 +192,8 @@ static bool save_photo(const uint8_t* jpeg_data, size_t jpeg_len, size_t* out_si
         fs->mkdir("/images");
     }
 
-    // Перекодированный файл может оказаться больше исходного
-    if (free_bytes < jpeg_len * 2 + 65536) {
+    // Q_BEST + 4:4:4 дают файл крупнее исходного — закладываем запас 256 КБ
+    if (free_bytes < jpeg_len * 2 + 262144) {
         Serial.printf("not enough space (%u free, need %u)\n",
                       (unsigned)free_bytes, (unsigned)(jpeg_len * 2 + 65536));
         return false;
@@ -235,22 +239,31 @@ static bool save_photo(const uint8_t* jpeg_data, size_t jpeg_len, size_t* out_si
     bool ok = false;
 
     enc_file = &f;
+    enc_write_err = false;
     if (jpg.open(path, enc_open_cb, nullptr, enc_read_cb,
                  enc_write_cb, enc_seek_cb) == JPEGE_SUCCESS) {
+        // Q_BEST + 4:4:4 — максимум деталей: края знаков резкие,
+        // цветные подчёркивания/шкалы не размазываются (читает ИИ/OCR)
         if (jpg.encodeBegin(&enc, out_w, out_h, JPEGE_PIXEL_RGB565,
-                            JPEGE_SUBSAMPLE_420, JPEGE_Q_HIGH) == JPEGE_SUCCESS) {
+                            JPEGE_SUBSAMPLE_444, JPEGE_Q_BEST) == JPEGE_SUCCESS) {
             jpg.addFrame(&enc, (uint8_t*)tbuf, out_w * 2);
             int32_t total = jpg.close();
-            ok = total > 0;
+            ok = total > 0 && !enc_write_err;
             if (ok && out_size) *out_size = (size_t)total;
         }
     }
     enc_file = nullptr;
     f.close();
+    if (!ok) {
+        fs->remove(path);  // не оставляем битый/недописанный файл
+        free(tbuf);
+        Serial.println("save: encode/write failed, partial file removed");
+        return false;
+    }
     free(tbuf);
 
-    Serial.printf("Saved %s (%s, %dx%d)\n", path, ok ? "ok" : "fail", out_w, out_h);
-    return ok;
+    Serial.printf("Saved %s (%d bytes, %dx%d)\n", path, (int)(out_size ? *out_size : 0), out_w, out_h);
+    return true;
 }
 
 void camera_app_open(lv_obj_t* parent) {
