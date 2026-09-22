@@ -6,6 +6,7 @@ struct DecodeCtx {
     int out_w;
     int out_h;
     uint32_t stride;  // bytes per row
+    bool transpose;   // swap rows/cols (matches preview orientation)
 };
 
 static DecodeCtx decode_ctx;
@@ -23,6 +24,24 @@ static int jpeg_draw_cb(JPEGDRAW* pDraw) {
     int16_t w = pDraw->iWidth;
     int16_t h = pDraw->iHeight;
     uint16_t* src = pDraw->pPixels;
+
+    if (ctx->transpose) {
+        // dst[строка = src столбец][столбец = src строка] — транспонирование.
+        // В точности повторяет scale_image() предпросмотра.
+        for (int row = 0; row < h; row++) {
+            int sy = y + row;               // src row → dst col
+            if (sy < 0 || sy >= ctx->out_w) continue;
+
+            for (int col = 0; col < w; col++) {
+                int sx = x + col;           // src col → dst row
+                if (sx < 0 || sx >= ctx->out_h) continue;
+
+                uint16_t* dst = (uint16_t*)((uint8_t*)ctx->buf + sx * ctx->stride) + sy;
+                *dst = src[row * w + col];
+            }
+        }
+        return 1;
+    }
 
     for (int row = 0; row < h; row++) {
         int dst_y = y + row;
@@ -76,7 +95,8 @@ void jpeg_close() {
 bool jpeg_decode_to_rgb565(const uint8_t* jpeg_data, size_t jpeg_len,
                             uint8_t* out_buf, int out_w, int out_h,
                             uint32_t out_stride, int scale,
-                            int* actual_w, int* actual_h) {
+                            int* actual_w, int* actual_h,
+                            bool transpose) {
     cb_count = 0;
 
     if (!jpeg_ptr) jpeg_ptr = new JPEGDEC();
@@ -97,6 +117,7 @@ bool jpeg_decode_to_rgb565(const uint8_t* jpeg_data, size_t jpeg_len,
     decode_ctx.out_w = out_w;
     decode_ctx.out_h = out_h;
     decode_ctx.stride = out_stride;
+    decode_ctx.transpose = transpose;
 
     jpeg_ptr->setUserPointer(&decode_ctx);
 
@@ -104,7 +125,9 @@ bool jpeg_decode_to_rgb565(const uint8_t* jpeg_data, size_t jpeg_len,
     int h = jpeg_ptr->getHeight();
 
     int opts = JPEG_SCALE_EIGHTH;
-    if (scale > 0) {
+    if (transpose) {
+        opts = 0;  // полное разрешение — файл сохраняется без потери деталей
+    } else if (scale > 0) {
         if (scale >= 8) opts = JPEG_SCALE_EIGHTH;
         else if (scale >= 4) opts = JPEG_SCALE_QUARTER;
         else if (scale >= 2) opts = JPEG_SCALE_HALF;
@@ -125,6 +148,8 @@ bool jpeg_decode_to_rgb565(const uint8_t* jpeg_data, size_t jpeg_len,
 
     int dec_w = (w + (1 << shift) - 1) >> shift;
     int dec_h = (h + (1 << shift) - 1) >> shift;
+
+    if (transpose) { int t = dec_w; dec_w = dec_h; dec_h = t; }
 
     if (actual_w) *actual_w = dec_w;
     if (actual_h) *actual_h = dec_h;

@@ -7,6 +7,7 @@
 #include "services/storage_service.h"
 #include "ui/theme.h"
 #include <Arduino.h>
+#include <JPEGENC.h>
 #include <time.h>
 #include <FS.h>
 #include <LittleFS.h>
@@ -34,7 +35,10 @@ static bool saving = false;
 static int cam_brightness = 0;   // -2..2
 static int cam_focus = 512;      // 0..1023
 
-// Scale only (no rotation — sensor handles hmirror/vflip)
+// Масштабирование + транспонирование (оси X/Y намеренно swapped):
+// сенсор физически повёрнут, предпросмотр показывает кадр в правильной
+// ориентации. save_photo() применяет такое же транспонирование к JPEG,
+// чтобы сохранённое фото совпадало с предпросмотром.
 static void scale_image(const uint16_t* src, int src_w, int src_h,
                         uint16_t* dst, int dst_w, int dst_h, uint32_t dst_stride) {
     if (src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0) return;
@@ -90,7 +94,28 @@ static void refresh_cb(lv_timer_t* timer) {
     camera_release();
 }
 
-static bool save_photo(const uint8_t* jpeg_data, size_t jpeg_len) {
+// --- JPEGENC: запись напрямую в открытый File ---
+static File* enc_file = nullptr;
+
+static void* enc_open_cb(const char* /*name*/) {
+    return enc_file;  // File уже открыт до вызова JPEGENC::open()
+}
+static int32_t enc_write_cb(JPEGE_FILE* f, uint8_t* buf, int32_t len) {
+    File* fp = (File*)f->fHandle;
+    return fp ? (int32_t)fp->write(buf, (size_t)len) : 0;
+}
+static int32_t enc_read_cb(JPEGE_FILE*, uint8_t*, int32_t) {
+    return 0;  // при кодировании не читаем
+}
+static int32_t enc_seek_cb(JPEGE_FILE* f, int32_t pos) {
+    File* fp = (File*)f->fHandle;
+    return fp && fp->seek((uint32_t)pos) ? pos : -1;
+}
+
+// Сохранить фото в той же ориентации, что и предпросмотр:
+// JPEG → декодирование в RGB565 (полное разрешение) → транспонирование
+// → повторное кодирование в JPEG.
+static bool save_photo(const uint8_t* jpeg_data, size_t jpeg_len, size_t* out_size) {
     FS* fs;
     size_t free_bytes;
 
@@ -111,9 +136,35 @@ static bool save_photo(const uint8_t* jpeg_data, size_t jpeg_len) {
         fs->mkdir("/images");
     }
 
-    if (free_bytes < jpeg_len + 4096) {
+    // Перекодированный файл может оказаться больше исходного
+    if (free_bytes < jpeg_len * 2 + 65536) {
         Serial.printf("not enough space (%u free, need %u)\n",
-                      (unsigned)free_bytes, (unsigned)jpeg_len);
+                      (unsigned)free_bytes, (unsigned)(jpeg_len * 2 + 65536));
+        return false;
+    }
+
+    // Узнать размеры исходника
+    int src_w = 0, src_h = 0;
+    if (!jpeg_open(jpeg_data, jpeg_len, &src_w, &src_h)) return false;
+
+    // Транспонированный кадр: ширина = высота сенсора (1200),
+    // высота = ширина сенсора (1600). ~3.84 MB в PSRAM.
+    int out_w = src_h;
+    int out_h = src_w;
+    size_t buf_size = (size_t)out_w * out_h * 2;
+
+    uint16_t* tbuf = (uint16_t*)ps_malloc(buf_size);
+    if (!tbuf) {
+        Serial.println("save: no PSRAM for rotation buffer");
+        return false;
+    }
+    memset(tbuf, 0, buf_size);
+
+    if (!jpeg_decode_to_rgb565(jpeg_data, jpeg_len, (uint8_t*)tbuf,
+                               out_w, out_h, out_w * 2, 0,
+                               nullptr, nullptr, true)) {
+        Serial.println("save: decode failed");
+        free(tbuf);
         return false;
     }
 
@@ -125,35 +176,29 @@ static bool save_photo(const uint8_t* jpeg_data, size_t jpeg_len) {
              t->tm_hour, t->tm_min, t->tm_sec);
 
     File f = fs->open(path, FILE_WRITE);
-    if (!f) return false;
+    if (!f) { free(tbuf); return false; }
 
-    // Write SOI marker
-    f.write((uint8_t*)"\xFF\xD8", 2);
+    static JPEGENC jpg;   // ~4KB — держим в статике, не на стеке
+    JPEGENCODE enc;
+    bool ok = false;
 
-    // Write EXIF APP1 with orientation tag = 6 (90° CW)
-    // This makes viewers auto-rotate the photo to match preview
-    static const uint8_t exif_app1[] = {
-        0xFF, 0xE1,             // APP1 marker
-        0x00, 0x32,             // APP1 length (50 bytes)
-        0x45, 0x78, 0x69, 0x66, 0x00, 0x00,  // "Exif\0\0"
-        0x49, 0x49,             // TIFF byte order (little-endian)
-        0x00, 0x2A,             // TIFF magic (42)
-        0x08, 0x00, 0x00, 0x00,// IFD0 offset (8)
-        0x01, 0x00,             // IFD0 entry count (1)
-        0x01, 0x01,             // Tag: Orientation (0x0112)
-        0x00, 0x03,             // Type: SHORT (3)
-        0x00, 0x00, 0x00, 0x01,// Count: 1
-        0x00, 0x06, 0x00, 0x00 // Value: 6 (90° CW)
-    };
-    f.write(exif_app1, sizeof(exif_app1));
-
-    // Write JPEG data (skip SOI - first 2 bytes)
-    size_t written = f.write(jpeg_data + 2, jpeg_len - 2);
+    enc_file = &f;
+    if (jpg.open(path, enc_open_cb, nullptr, enc_read_cb,
+                 enc_write_cb, enc_seek_cb) == JPEGE_SUCCESS) {
+        if (jpg.encodeBegin(&enc, out_w, out_h, JPEGE_PIXEL_RGB565,
+                            JPEGE_SUBSAMPLE_420, JPEGE_Q_HIGH) == JPEGE_SUCCESS) {
+            jpg.addFrame(&enc, (uint8_t*)tbuf, out_w * 2);
+            int32_t total = jpg.close();
+            ok = total > 0;
+            if (ok && out_size) *out_size = (size_t)total;
+        }
+    }
+    enc_file = nullptr;
     f.close();
+    free(tbuf);
 
-    Serial.printf("Saved %s (%u bytes + EXIF)\n", path, (unsigned)(written + sizeof(exif_app1) + 2));
-
-    return written == (jpeg_len - 2);
+    Serial.printf("Saved %s (%s, %dx%d)\n", path, ok ? "ok" : "fail", out_w, out_h);
+    return ok;
 }
 
 void camera_app_open(lv_obj_t* parent) {
@@ -280,11 +325,15 @@ void camera_app_button(int button_id, int event) {
             }
         }
 
-        // Сохранить JPEG как есть (полное разрешение UXGA 1600x1200)
-        // hmirror+vflip уже применены на уровне сенсора
-        if (save_photo(jpeg_buf, jpeg_len)) {
+        // Сохранить: декодировать + транспонировать (как предпросмотр)
+        // + закодировать в JPEG. Полное разрешение, несколько секунд.
+        lv_label_set_text_fmt(lbl_status, "%s ...", LV_SYMBOL_REFRESH);
+        lv_refr_now(lv_display_get_default());
+
+        size_t saved_size = 0;
+        if (save_photo(jpeg_buf, jpeg_len, &saved_size)) {
             lv_label_set_text_fmt(lbl_status, "%s OK! (%u KB)",
-                                  LV_SYMBOL_OK, (unsigned)(jpeg_len / 1024));
+                                  LV_SYMBOL_OK, (unsigned)(saved_size / 1024));
         } else {
             lv_label_set_text_fmt(lbl_status, "%s %s",
                                   LV_SYMBOL_WARNING, "Save failed");
