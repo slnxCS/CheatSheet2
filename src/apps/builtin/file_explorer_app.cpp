@@ -643,6 +643,8 @@ void file_explorer_open(lv_obj_t* parent) {
 }
 
 void file_explorer_button(int button_id, int event) {
+    if (event != BTN_EVENT_CLICKED) return;
+
     if (viewer_mode != VIEW_NONE) {
         if (button_id == BTN_ID_LEFT || button_id == BTN_ID_OK) {
             close_viewer();

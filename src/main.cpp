@@ -11,6 +11,8 @@
 #include "apps/builtin/file_explorer_app.h"
 #include "apps/builtin/snake_game.h"
 #include "apps/builtin/game_2048.h"
+#include "apps/builtin/tetris_game.h"
+#include "apps/builtin/flappy_game.h"
 #include "services/lang_service.h"
 #include "services/storage_service.h"
 #include "services/battery_service.h"
@@ -37,7 +39,9 @@ static void on_button(ButtonId id, ButtonEvent event) {
             ui_manager_reload_home();
             return;
         }
-        if (event == BTN_EVENT_CLICKED) {
+        // PRESSED тоже пробрасываем — игры (Flappy) реагируют на нажатие,
+        // остальные приложения фильтруют по BTN_EVENT_CLICKED
+        if (event == BTN_EVENT_CLICKED || event == BTN_EVENT_PRESSED) {
             AppContext* app = app_registry_get_running();
             if (app && app->on_button) {
                 app->on_button((int)id, (int)event);
@@ -121,6 +125,8 @@ void setup() {
     app_registry_add(lang_str_app_explorer(), LV_SYMBOL_DIRECTORY, file_explorer_open, file_explorer_close, file_explorer_button);
     app_registry_add("Snake", LV_SYMBOL_PLAY, snake_game_open, snake_game_close, snake_game_button);
     app_registry_add("2048", LV_SYMBOL_PLAY, game_2048_open, game_2048_close, game_2048_button);
+    app_registry_add("Tetris", LV_SYMBOL_PLAY, tetris_game_open, tetris_game_close, tetris_game_button);
+    app_registry_add("Flappy", LV_SYMBOL_PLAY, flappy_game_open, flappy_game_close, flappy_game_button);
     Serial.printf("[3/6] Apps registered: %d\n", app_registry_count());
 
     Serial.println("[4/6] UI...");
