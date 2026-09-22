@@ -51,6 +51,7 @@ static ViewerMode viewer_mode = VIEW_NONE;
 static char* text_buf = nullptr;
 static uint8_t* img_data = nullptr;
 static size_t img_data_size = 0;
+static uint8_t* img_canvas_buf = nullptr;  // вписанное RGB565 изображение
 static lv_fs_path_ex_t img_mempath;
 
 // --- Хелперы для путей ---
@@ -112,6 +113,44 @@ static bool is_text_file(const char* name) {
             strcasecmp(ext, "md") == 0 || strcasecmp(ext, "py") == 0 ||
             strcasecmp(ext, "js") == 0 || strcasecmp(ext, "html") == 0 ||
             strcasecmp(ext, "css") == 0) || strcasecmp(ext, "bin") == 0;
+}
+
+// Вписать src в dst с сохранением пропорций (area-average даунскейл)
+static void fit_scale_rgb565(const uint16_t* src, int sw, int sh,
+                             uint16_t* dst, int dw, int dh, uint32_t dst_stride) {
+    if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return;
+
+    int32_t sx_step = ((int32_t)sw << 16) / dw;
+    int32_t sy_step = ((int32_t)sh << 16) / dh;
+
+    for (int dy = 0; dy < dh; dy++) {
+        uint16_t* drow = (uint16_t*)((uint8_t*)dst + (size_t)dy * dst_stride);
+        int32_t y0 = (int32_t)(((int64_t)dy * sy_step) >> 16);
+        int32_t y1 = (int32_t)(((int64_t)(dy + 1) * sy_step) >> 16);
+        if (y1 <= y0) y1 = y0 + 1;
+        if (y1 > sh) y1 = sh;
+
+        for (int dx = 0; dx < dw; dx++) {
+            int32_t x0 = (int32_t)(((int64_t)dx * sx_step) >> 16);
+            int32_t x1 = (int32_t)(((int64_t)(dx + 1) * sx_step) >> 16);
+            if (x1 <= x0) x1 = x0 + 1;
+            if (x1 > sw) x1 = sw;
+
+            uint32_t r = 0, g = 0, b = 0, n = 0;
+            for (int y = y0; y < y1; y++) {
+                const uint16_t* srow = src + y * sw;
+                for (int x = x0; x < x1; x++) {
+                    uint16_t p = srow[x];
+                    r += (p >> 11) & 0x1F;
+                    g += (p >> 5) & 0x3F;
+                    b += p & 0x1F;
+                    n++;
+                }
+            }
+            if (n == 0) n = 1;
+            drow[dx] = (uint16_t)(((r / n) << 11) | ((g / n) << 5) | (b / n));
+        }
+    }
 }
 
 static bool is_image_file(const char* name) {
@@ -293,6 +332,10 @@ static void close_viewer() {
         img_data = nullptr;
         img_data_size = 0;
     }
+    if (img_canvas_buf) {
+        free(img_canvas_buf);
+        img_canvas_buf = nullptr;
+    }
     if (viewer_obj) {
         lv_obj_delete(viewer_obj);
         viewer_obj = nullptr;
@@ -395,28 +438,68 @@ static void open_image_viewer(String filepath, const char* filename) {
     lv_obj_set_style_text_font(viewer_title, &lv_font_cyr_14, 0);
     lv_obj_align(viewer_title, LV_ALIGN_CENTER, 0, 0);
 
-    // Регистрируем JPEG в MEMFS для декодирования LVGL TJPGD
-    lv_fs_make_path_from_buffer(&img_mempath, LV_FS_MEMFS_LETTER, img_data, img_data_size, "jpg");
-    viewer_content = lv_img_create(viewer_obj);
-    lv_img_set_src(viewer_content, &img_mempath);
-
-    // Вписать фото в экран с сохранением пропорций —
-    // иначе LVGL показывает 1200x1600 в натуральную величину (видно уголок)
+    // JPEG декодируем сами (JPEGDEC) и вписываем в экран через lv_canvas:
+    // LVGL TJPGD декодирует частично и запрещает трансформации (zoom),
+    // поэтому фото в натуральной величине = виден только уголок.
     int jw = 0, jh = 0;
-    if (jpeg_open(img_data, img_data_size, &jw, &jh) && jw > 0 && jh > 0) {
-        jpeg_close();
-        int avail_w = 320 - 8;
-        int avail_h = 240 - 28 - 8;
-        uint32_t zx = ((uint32_t)avail_w * 256) / (uint32_t)jw;
-        uint32_t zy = ((uint32_t)avail_h * 256) / (uint32_t)jh;
-        uint32_t zoom = zx < zy ? zx : zy;
-        if (zoom < 4) zoom = 4;      // ограничение LVGL
-        if (zoom > 256) zoom = 256;  // не увеличивать
-        lv_image_set_scale(viewer_content, zoom);
-        lv_image_set_antialias(viewer_content, true);
+    bool is_jpeg = jpeg_open(img_data, img_data_size, &jw, &jh) && jw > 0 && jh > 0;
+    if (is_jpeg) jpeg_close();
+
+    bool canvas_ok = false;
+    if (is_jpeg) {
+        const int avail_w = 320 - 8;
+        const int avail_h = 240 - 28 - 8;
+
+        // Fit dims с сохранением пропорций (не увеличиваем)
+        int32_t scale = ((int32_t)avail_w << 16) / jw;
+        int32_t scale_h = ((int32_t)avail_h << 16) / jh;
+        if (scale_h < scale) scale = scale_h;
+        if (scale > (1 << 16)) scale = 1 << 16;
+        int out_w = (int)(((int64_t)jw * scale) >> 16);
+        int out_h = (int)(((int64_t)jh * scale) >> 16);
+        if (out_w < 1) out_w = 1;
+        if (out_h < 1) out_h = 1;
+
+        // Наименьший знаменатель d из {1,2,4,8}, чтобы декод ≥ размера вписывания
+        int d = 1;
+        if ((jw + 1) / 2 >= out_w && (jh + 1) / 2 >= out_h) d = 2;
+        if ((jw + 3) / 4 >= out_w && (jh + 3) / 4 >= out_h) d = 4;
+        if ((jw + 7) / 8 >= out_w && (jh + 7) / 8 >= out_h) d = 8;
+        int scale_param = (d == 1) ? 1 : (d == 2) ? 2 : (d == 4) ? 4 : 8;
+
+        int dec_w = (jw + d - 1) / d;
+        int dec_h = (jh + d - 1) / d;
+        uint8_t* temp = (uint8_t*)ps_malloc((size_t)dec_w * dec_h * 2);
+
+        if (temp) {
+            int aw = 0, ah = 0;
+            if (jpeg_decode_to_rgb565(img_data, img_data_size,
+                                      temp, dec_w, dec_h, dec_w * 2,
+                                      scale_param, &aw, &ah) && aw > 0 && ah > 0) {
+                img_canvas_buf = (uint8_t*)ps_malloc((size_t)out_w * out_h * 2);
+                if (img_canvas_buf) {
+                    memset(img_canvas_buf, 0, (size_t)out_w * out_h * 2);
+                    fit_scale_rgb565((uint16_t*)temp, aw, ah,
+                                     (uint16_t*)img_canvas_buf,
+                                     out_w, out_h, out_w * 2);
+                    viewer_content = lv_canvas_create(viewer_obj);
+                    lv_canvas_set_buffer(viewer_content, img_canvas_buf,
+                                         out_w, out_h, LV_COLOR_FORMAT_RGB565);
+                    lv_obj_align(viewer_content, LV_ALIGN_CENTER, 0, 14);
+                    canvas_ok = true;
+                }
+            }
+            free(temp);
+        }
     }
 
-    lv_obj_align(viewer_content, LV_ALIGN_CENTER, 0, 14);
+    if (!canvas_ok) {
+        // png/bmp и запасной путь: MEMFS без трансформаций
+        lv_fs_make_path_from_buffer(&img_mempath, LV_FS_MEMFS_LETTER, img_data, img_data_size, "jpg");
+        viewer_content = lv_img_create(viewer_obj);
+        lv_img_set_src(viewer_content, &img_mempath);
+        lv_obj_align(viewer_content, LV_ALIGN_CENTER, 0, 14);
+    }
 
     if (hint_label) {
         lv_label_set_text_fmt(hint_label, LV_SYMBOL_LEFT " %s", lang_str_explorer_back());
