@@ -112,15 +112,20 @@ void camera_deinit() {
 bool camera_capture(uint8_t** buf, size_t* len) {
     if (!cam_ready) return false;
 
-    current_fb = esp_camera_fb_get();
-    if (!current_fb) {
-        Serial.println("Camera capture failed");
-        return false;
+    // Кадр может быть не готов сразу — несколько попыток,
+    // чтобы одно нажатие OK гарантированно давало фото
+    for (int attempt = 0; attempt < 5; attempt++) {
+        current_fb = esp_camera_fb_get();
+        if (current_fb) {
+            *buf = current_fb->buf;
+            *len = current_fb->len;
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(30));
     }
 
-    *buf = current_fb->buf;
-    *len = current_fb->len;
-    return true;
+    Serial.println("Camera capture failed");
+    return false;
 }
 
 void camera_release() {

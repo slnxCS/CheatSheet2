@@ -17,6 +17,7 @@ struct LangStrings {
     const char* camera_ready;
     const char* camera_captured;
     const char* camera_no_camera;
+    const char* camera_error;
     const char* camera_failed;
     const char* explorer_title;
     const char* explorer_flash;
@@ -39,6 +40,7 @@ static const LangStrings lang_en = {
     .camera_ready    = "Ready - press OK to capture",
     .camera_captured = "Captured",
     .camera_no_camera = "No camera",
+    .camera_error = "Save failed",
     .camera_failed   = "Camera init failed",
     .explorer_title  = "Explorer",
     .explorer_flash  = "Flash",
@@ -61,6 +63,7 @@ static const LangStrings lang_ru = {
     .camera_ready    = "Готово - нажмите OK",
     .camera_captured = "Снято",
     .camera_no_camera = "Нет камеры",
+    .camera_error = "Ошибка сохранения",
     .camera_failed   = "Ошибка камеры",
     .explorer_title  = "Проводник",
     .explorer_flash  = "Flash",
@@ -111,6 +114,7 @@ const char* lang_str_camera_init()    { return langs[current_lang]->camera_init;
 const char* lang_str_camera_ready()   { return langs[current_lang]->camera_ready; }
 const char* lang_str_camera_captured(){ return langs[current_lang]->camera_captured; }
 const char* lang_str_camera_no_camera() { return langs[current_lang]->camera_no_camera; }
+const char* lang_str_camera_error()    { return langs[current_lang]->camera_error; }
 const char* lang_str_camera_failed()  { return langs[current_lang]->camera_failed; }
 const char* lang_str_app_explorer()   { return langs[current_lang]->app_explorer; }
 const char* lang_str_explorer_title() { return langs[current_lang]->explorer_title; }

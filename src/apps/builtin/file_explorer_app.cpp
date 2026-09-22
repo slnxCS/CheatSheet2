@@ -1,4 +1,5 @@
 #include "drivers/input.h"
+#include "drivers/jpeg_decoder.h"
 #include "fonts/fonts.h"
 #include "apps/builtin/file_explorer_app.h"
 #include "services/lang_service.h"
@@ -398,6 +399,23 @@ static void open_image_viewer(String filepath, const char* filename) {
     lv_fs_make_path_from_buffer(&img_mempath, LV_FS_MEMFS_LETTER, img_data, img_data_size, "jpg");
     viewer_content = lv_img_create(viewer_obj);
     lv_img_set_src(viewer_content, &img_mempath);
+
+    // Вписать фото в экран с сохранением пропорций —
+    // иначе LVGL показывает 1200x1600 в натуральную величину (видно уголок)
+    int jw = 0, jh = 0;
+    if (jpeg_open(img_data, img_data_size, &jw, &jh) && jw > 0 && jh > 0) {
+        jpeg_close();
+        int avail_w = 320 - 8;
+        int avail_h = 240 - 28 - 8;
+        uint32_t zx = ((uint32_t)avail_w * 256) / (uint32_t)jw;
+        uint32_t zy = ((uint32_t)avail_h * 256) / (uint32_t)jh;
+        uint32_t zoom = zx < zy ? zx : zy;
+        if (zoom < 4) zoom = 4;      // ограничение LVGL
+        if (zoom > 256) zoom = 256;  // не увеличивать
+        lv_image_set_scale(viewer_content, zoom);
+        lv_image_set_antialias(viewer_content, true);
+    }
+
     lv_obj_align(viewer_content, LV_ALIGN_CENTER, 0, 14);
 
     if (hint_label) {

@@ -21,6 +21,7 @@ const char* lang_str_camera_init();
 const char* lang_str_camera_ready();
 const char* lang_str_camera_captured();
 const char* lang_str_camera_no_camera();
+const char* lang_str_camera_error();
 const char* lang_str_camera_failed();
 const char* lang_str_app_explorer();
 const char* lang_str_explorer_title();

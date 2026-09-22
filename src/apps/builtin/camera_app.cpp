@@ -29,36 +29,88 @@ static uint8_t* canvas_buf = nullptr;
 static uint8_t* temp_buf = nullptr;
 static uint32_t canvas_stride = 0;
 
+// --- Плашка «Снято» ---
+static lv_obj_t* toast = nullptr;
+static lv_obj_t* toast_lbl = nullptr;
+
+static void toast_set(const char* text, lv_color_t bg) {
+    if (!parent_ref) return;
+
+    if (!toast) {
+        toast = lv_obj_create(parent_ref);
+        lv_obj_set_size(toast, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        lv_obj_set_style_radius(toast, 12, 0);
+        lv_obj_set_style_border_width(toast, 0, 0);
+        lv_obj_set_style_pad_all(toast, 14, 0);
+        lv_obj_set_style_bg_opa(toast, LV_OPA_90, 0);
+        lv_obj_set_scrollbar_mode(toast, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_remove_flag(toast, LV_OBJ_FLAG_SCROLLABLE);
+
+        toast_lbl = lv_label_create(toast);
+        lv_obj_set_style_text_color(toast_lbl, lv_color_white(), 0);
+        lv_obj_set_style_text_font(toast_lbl, &lv_font_cyr_24, 0);
+        lv_obj_set_style_text_align(toast_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    }
+
+    lv_obj_set_style_bg_color(toast, bg, 0);
+    lv_label_set_text(toast_lbl, text);
+    lv_obj_center(toast);
+}
+
+static void toast_hide() {
+    if (toast) {
+        lv_obj_delete(toast);
+        toast = nullptr;
+        toast_lbl = nullptr;
+    }
+}
+
 static bool preview_active = false;
 static bool saving = false;
 
 static int cam_brightness = 0;   // -2..2
 static int cam_focus = 512;      // 0..1023
 
-// Масштабирование + транспонирование (оси X/Y намеренно swapped):
-// сенсор физически повёрнут, предпросмотр показывает кадр в правильной
-// ориентации. save_photo() применяет такое же транспонирование к JPEG,
-// чтобы сохранённое фото совпадало с предпросмотром.
+// Транспонирование (оси X/Y swapped — сенсор физически повёрнут) +
+// вписывание с сохранением пропорций. Предпросмотр теперь совпадает
+// с сохранённым фото 1 к 1 (чёрные поля по краям).
 static void scale_image(const uint16_t* src, int src_w, int src_h,
                         uint16_t* dst, int dst_w, int dst_h, uint32_t dst_stride) {
     if (src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0) return;
 
-    int32_t sy_step = ((int32_t)src_h << 16) / dst_w;
-    int32_t sx_step = ((int32_t)src_w << 16) / dst_h;
+    // Очистить весь canvas — чёрные поля
+    memset(dst, 0, (size_t)dst_stride * dst_h);
 
-    for (int dy = 0; dy < dst_h; dy++) {
-        uint16_t* dst_row = (uint16_t*)((uint8_t*)dst + dy * dst_stride);
+    // Транспонированный размер: ширина = высота src, высота = ширина src
+    int t_w = src_h;
+    int t_h = src_w;
+
+    // Вписать в dst с сохранением пропорций (fixed point 16.16)
+    int32_t scale = ((int32_t)dst_w << 16) / t_w;
+    int32_t scale_h = ((int32_t)dst_h << 16) / t_h;
+    if (scale_h < scale) scale = scale_h;
+
+    int out_w = (int)(((int64_t)t_w * scale) >> 16);
+    int out_h = (int)(((int64_t)t_h * scale) >> 16);
+    if (out_w < 1) out_w = 1;
+    if (out_h < 1) out_h = 1;
+
+    int x0 = (dst_w - out_w) / 2;
+    int y0 = (dst_h - out_h) / 2;
+
+    // Строка dst ↔ столбец src, столбец dst ↔ строка src (транспонирование)
+    int32_t sx_step = ((int32_t)src_w << 16) / out_h;   // dy → src_x
+    int32_t sy_step = ((int32_t)src_h << 16) / out_w;   // dx → src_y
+
+    for (int dy = 0; dy < out_h; dy++) {
+        uint16_t* dst_row = (uint16_t*)((uint8_t*)dst + (size_t)(y0 + dy) * dst_stride) + x0;
         int32_t sx_fixed = dy * sx_step;
 
-        for (int dx = 0; dx < dst_w; dx++) {
-            int32_t sy_fixed = dx * sy_step;
-
+        for (int dx = 0; dx < out_w; dx++) {
             int32_t src_x = sx_fixed >> 16;
-            int32_t src_y = sy_fixed >> 16;
+            int32_t src_y = ((int32_t)dx * sy_step) >> 16;
 
-            if (src_x < 0) src_x = 0;
             if (src_x >= src_w) src_x = src_w - 1;
-            if (src_y < 0) src_y = 0;
             if (src_y >= src_h) src_y = src_h - 1;
 
             dst_row[dx] = src[src_y * src_w + src_x];
@@ -287,8 +339,26 @@ void camera_app_close() {
     parent_ref = nullptr;
     lbl_status = nullptr;
     canvas = nullptr;
+    toast = nullptr;
+    toast_lbl = nullptr;
     preview_active = false;
     saving = false;
+}
+
+// Вернуть предпросмотр и убрать плашку через delay_ms
+static void schedule_resume(uint32_t delay_ms) {
+    lv_timer_t* t = lv_timer_create([](lv_timer_t* timer) {
+        lv_timer_del(timer);
+        toast_hide();
+        preview_active = true;
+        saving = false;
+        if (lbl_status) {
+            lv_label_set_text_fmt(lbl_status, "%s %s  |  B:%d F:%d",
+                                  LV_SYMBOL_IMAGE, lang_str_camera_ready(),
+                                  cam_brightness, cam_focus);
+        }
+    }, delay_ms, nullptr);
+    (void)t;
 }
 
 void camera_app_button(int button_id, int event) {
@@ -299,8 +369,12 @@ void camera_app_button(int button_id, int event) {
 
         preview_active = false;
         saving = true;
+
+        // Плашка появляется сразу при нажатии — видно, что фото снято
+        toast_set(lang_str_camera_captured(), lv_color_hex(0x1B7F3B));
         lv_label_set_text_fmt(lbl_status, "%s %s",
                               LV_SYMBOL_REFRESH, lang_str_camera_captured());
+        lv_refr_now(lv_display_get_default());
 
         uint8_t* jpeg_buf = nullptr;
         size_t jpeg_len = 0;
@@ -308,12 +382,12 @@ void camera_app_button(int button_id, int event) {
         if (!camera_capture(&jpeg_buf, &jpeg_len)) {
             lv_label_set_text_fmt(lbl_status, "%s %s",
                                   LV_SYMBOL_WARNING, lang_str_camera_no_camera());
-            saving = false;
-            preview_active = true;
+            toast_set(lang_str_camera_no_camera(), lv_color_hex(0xB33A3A));
+            schedule_resume(1500);
             return;
         }
 
-        // Показать захват на экране (EIGHTH scale)
+        // Показать захват на экране (EIGHTH scale, вписан 1:1)
         int dec_w = 0, dec_h = 0;
         if (jpeg_decode_to_rgb565(jpeg_buf, jpeg_len,
                                   temp_buf, 200, 150, 200 * 2, 8,
@@ -328,30 +402,23 @@ void camera_app_button(int button_id, int event) {
         // Сохранить: декодировать + транспонировать (как предпросмотр)
         // + закодировать в JPEG. Полное разрешение, несколько секунд.
         lv_label_set_text_fmt(lbl_status, "%s ...", LV_SYMBOL_REFRESH);
-        lv_refr_now(lv_display_get_default());
 
         size_t saved_size = 0;
         if (save_photo(jpeg_buf, jpeg_len, &saved_size)) {
+            char t[64];
+            snprintf(t, sizeof(t), "%s (%u KB)",
+                     lang_str_camera_captured(), (unsigned)(saved_size / 1024));
+            toast_set(t, lv_color_hex(0x1B7F3B));
             lv_label_set_text_fmt(lbl_status, "%s OK! (%u KB)",
                                   LV_SYMBOL_OK, (unsigned)(saved_size / 1024));
         } else {
+            toast_set(lang_str_camera_error(), lv_color_hex(0xB33A3A));
             lv_label_set_text_fmt(lbl_status, "%s %s",
-                                  LV_SYMBOL_WARNING, "Save failed");
+                                  LV_SYMBOL_WARNING, lang_str_camera_error());
         }
 
         camera_release();
-
-        // Resume preview after 2 seconds
-        lv_timer_t* resume_timer = lv_timer_create([](lv_timer_t* t) {
-            lv_timer_del(t);
-            preview_active = true;
-            saving = false;
-            if (lbl_status) {
-                lv_label_set_text_fmt(lbl_status, "%s %s  |  B:%d F:%d",
-                                      LV_SYMBOL_IMAGE, lang_str_camera_ready(),
-                                      cam_brightness, cam_focus);
-            }
-        }, 2000, nullptr);
+        schedule_resume(2000);
 
     } else if (button_id == BTN_ID_UP) {
         // Яркость +
