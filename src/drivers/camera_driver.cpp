@@ -135,6 +135,45 @@ void camera_release() {
     }
 }
 
+bool camera_capture_after(uint8_t** buf, size_t* len, uint64_t after_ms) {
+    if (!cam_ready) return false;
+
+    camera_fb_t* fb = nullptr;
+    uint64_t start_ms = millis();
+
+    for (int i = 0; i < 30; i++) {
+        camera_fb_t* f = esp_camera_fb_get();
+        if (f) {
+            uint64_t ts = (uint64_t)f->timestamp.tv_sec * 1000 +
+                          (uint64_t)f->timestamp.tv_usec / 1000;
+            bool fresh;
+            if (ts > 0) {
+                fresh = (ts >= after_ms);           // кадр начат после установки фокуса
+            } else {
+                fresh = (millis() - start_ms >= 150);  // время не ведётся — ждём период кадра
+            }
+
+            if (fb) { esp_camera_fb_return(fb); fb = nullptr; }
+            if (fresh) {
+                current_fb = f;
+                *buf = f->buf;
+                *len = f->len;
+                return true;
+            }
+            fb = f;   // держим последний кадр как запасной, отдавая предыдущий
+        }
+        vTaskDelay(pdMS_TO_TICKS(25));
+    }
+
+    if (fb) {          // таймаут: возвращаем последний доступный кадр
+        current_fb = fb;
+        *buf = fb->buf;
+        *len = fb->len;
+        return true;
+    }
+    return false;
+}
+
 bool camera_is_ready() {
     return cam_ready;
 }
@@ -153,6 +192,10 @@ void camera_set_focus(int pos) {
     ov5640_set_focus(pos);
 }
 
+int camera_get_focus() {
+    return current_focus;
+}
+
 #else
 
 bool camera_init() {
@@ -161,9 +204,11 @@ bool camera_init() {
 }
 void camera_deinit() {}
 bool camera_capture(uint8_t** buf, size_t* len) { return false; }
+bool camera_capture_after(uint8_t** buf, size_t* len, uint64_t after_ms) { return false; }
 void camera_release() {}
 bool camera_is_ready() { return false; }
 void camera_set_brightness(int val) {}
 void camera_set_focus(int pos) {}
+int camera_get_focus() { return 0; }
 
 #endif

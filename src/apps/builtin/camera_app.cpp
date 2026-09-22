@@ -15,9 +15,10 @@
 
 #define SCREEN_W 320
 #define SCREEN_H 240
-#define HEADER_H 36
 #define IMG_W SCREEN_W
-#define IMG_H (SCREEN_H - HEADER_H)  // 204
+#define IMG_H SCREEN_H        // превью во весь экран; шапка/подсказки — поверх
+#define AF_W 400              // буфер превью и метрики AF = 1/4 UXGA
+#define AF_H 300
 
 // --- State ---
 static lv_obj_t* parent_ref = nullptr;
@@ -70,43 +71,56 @@ static bool saving = false;
 
 static int cam_brightness = 0;   // -2..2
 static int cam_focus = 512;      // 0..1023
+static bool preview_fill = true; // true = во всю ширину (кроп сверху/снизу),
+                                 // false = весь кадр (чёрные поля по бокам)
 
 // Транспонирование (оси X/Y swapped — сенсор физически повёрнут) +
-// вписывание с сохранением пропорций. Предпросмотр теперь совпадает
-// с сохранённым фото 1 к 1 (чёрные поля по краям).
+// вписывание (fit) или заполнение экрана (fill) с сохранением пропорций.
+// fill: картинка идёт во всю ширину, лишнее сверху/снизу обрезается по центру.
 static void scale_image(const uint16_t* src, int src_w, int src_h,
                         uint16_t* dst, int dst_w, int dst_h, uint32_t dst_stride) {
     if (src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0) return;
 
-    // Очистить весь canvas — чёрные поля
+    // Очистить весь canvas — фон под полями (в fill не виден)
     memset(dst, 0, (size_t)dst_stride * dst_h);
 
     // Транспонированный размер: ширина = высота src, высота = ширина src
     int t_w = src_h;
     int t_h = src_w;
 
-    // Вписать в dst с сохранением пропорций (fixed point 16.16)
-    int32_t scale = ((int32_t)dst_w << 16) / t_w;
+    // fit  = минимум из масштабов (вписать целиком, поля по бокам)
+    // fill = максимум (во весь экран, кроп по центру)
+    int32_t scale_w = ((int32_t)dst_w << 16) / t_w;
     int32_t scale_h = ((int32_t)dst_h << 16) / t_h;
-    if (scale_h < scale) scale = scale_h;
+    int32_t scale = preview_fill
+        ? (scale_w > scale_h ? scale_w : scale_h)
+        : (scale_w < scale_h ? scale_w : scale_h);
 
     int out_w = (int)(((int64_t)t_w * scale) >> 16);
     int out_h = (int)(((int64_t)t_h * scale) >> 16);
     if (out_w < 1) out_w = 1;
     if (out_h < 1) out_h = 1;
 
+    // Центрирование; при fill координаты отрицательные — кадрируем
     int x0 = (dst_w - out_w) / 2;
     int y0 = (dst_h - out_h) / 2;
+    int dy0 = y0 < 0 ? -y0 : 0;
+    int dy1 = out_h;
+    if (y0 + out_h > dst_h) dy1 = dst_h - y0;
+    int dx0 = x0 < 0 ? -x0 : 0;
+    int dx1 = out_w;
+    if (x0 + out_w > dst_w) dx1 = dst_w - x0;
+    if (dy0 >= dy1 || dx0 >= dx1) return;
 
     // Строка dst ↔ столбец src, столбец dst ↔ строка src (транспонирование)
     int32_t sx_step = ((int32_t)src_w << 16) / out_h;   // dy → src_x
     int32_t sy_step = ((int32_t)src_h << 16) / out_w;   // dx → src_y
 
-    for (int dy = 0; dy < out_h; dy++) {
+    for (int dy = dy0; dy < dy1; dy++) {
         uint16_t* dst_row = (uint16_t*)((uint8_t*)dst + (size_t)(y0 + dy) * dst_stride) + x0;
         int32_t sx_fixed = dy * sx_step;
 
-        for (int dx = 0; dx < out_w; dx++) {
+        for (int dx = dx0; dx < dx1; dx++) {
             int32_t src_x = sx_fixed >> 16;
             int32_t src_y = ((int32_t)dx * sy_step) >> 16;
 
@@ -131,10 +145,10 @@ static void refresh_cb(lv_timer_t* timer) {
         return;
     }
 
-    // Preview: EIGHTH scale of 1600x1200 = 200x150 (быстро)
+    // Preview: QUARTER scale of 1600x1200 = 400x300 (чётко для чтения текста)
     int dec_w = 0, dec_h = 0;
     if (jpeg_decode_to_rgb565(jpeg_buf, jpeg_len,
-                              temp_buf, 200, 150, 200 * 2, 8,
+                              temp_buf, AF_W, AF_H, AF_W * 2, 4,
                               &dec_w, &dec_h)) {
         if (dec_w > 0 && dec_h > 0) {
             scale_image((uint16_t*)temp_buf, dec_w, dec_h,
@@ -144,6 +158,81 @@ static void refresh_cb(lv_timer_t* timer) {
     }
 
     camera_release();
+}
+
+// --- Контрастный автофокус (CDAF) ---
+// Перебираем позиции фокус-мотора, меряем резкость (сумма модулей
+// горизонтального/вертикального градиента яркости) на кадре 1/4 UXGA.
+// Кадр обязателен свежий — снятый уже после установки DAC.
+static uint64_t af_since_ms = 0;
+
+static inline int af_luma(uint16_t p) {
+    // приближение яркости из RGB565: 3*R + 6*Г + 1*B
+    return (int)(((p >> 11) & 31) * 3 + ((p >> 5) & 63) * 6 + (p & 31));
+}
+
+static uint32_t measure_sharpness() {
+    uint8_t* jbuf = nullptr;
+    size_t jlen = 0;
+    if (!camera_capture_after(&jbuf, &jlen, af_since_ms)) return 0;
+
+    int dw = 0, dh = 0;
+    bool ok = jpeg_decode_to_rgb565(jbuf, jlen, temp_buf,
+                                    AF_W, AF_H, AF_W * 2, 4, &dw, &dh);
+    camera_release();
+    if (!ok || dw < 8 || dh < 8) return 0;
+
+    uint32_t sum = 0;
+    for (int y = 1; y < dh - 1; y++) {
+        const uint16_t* row  = (const uint16_t*)(temp_buf + (size_t)y * AF_W * 2);
+        const uint16_t* prow = (const uint16_t*)(temp_buf + (size_t)(y - 1) * AF_W * 2);
+        for (int x = 1; x < dw - 1; x++) {
+            int d = af_luma(row[x]) * 2 - af_luma(row[x - 1]) - af_luma(prow[x]);
+            if (d < 0) d = -d;
+            sum += (uint32_t)d;
+        }
+    }
+    return sum;
+}
+
+// Полный проход: грубый перебор всего хода мотора + точная подстройка.
+// ~2-2.5 с. Возвращает позицию лучшей резкости.
+static int run_autofocus(int start_pos) {
+    if (!camera_is_ready() || !temp_buf) return start_pos;
+
+    static const int COARSE[8] = {32, 160, 288, 416, 544, 672, 800, 928};
+    int best = start_pos;
+    uint32_t bestm = 0;
+
+    for (int i = 0; i < 8; i++) {
+        camera_set_focus(COARSE[i]);
+        delay(5);                     // мотору на сдвиг
+        af_since_ms = millis();       // кадр должен начаться позже
+        uint32_t m = measure_sharpness();
+        if (m > bestm) { bestm = m; best = COARSE[i]; }
+    }
+
+    // Ни одного валидного кадра — текущий фокус не трогаем
+    if (bestm == 0) {
+        Serial.println("AF: no frames, keep current focus");
+        camera_set_focus(start_pos);
+        return start_pos;
+    }
+
+    const int FINE[4] = {best - 64, best - 32, best + 32, best + 64};
+    for (int i = 0; i < 4; i++) {
+        int p = FINE[i];
+        if (p < 0 || p > 1023) continue;
+        camera_set_focus(p);
+        delay(5);
+        af_since_ms = millis();
+        uint32_t m = measure_sharpness();
+        if (m > bestm) { bestm = m; best = p; }
+    }
+
+    camera_set_focus(best);
+    Serial.printf("AF done: pos=%d sharp=%u\n", best, bestm);
+    return best;
 }
 
 // --- JPEGENC: запись напрямую в открытый File ---
@@ -272,32 +361,37 @@ void camera_app_open(lv_obj_t* parent) {
     saving = false;
     cam_brightness = 0;
     cam_focus = 512;
+    preview_fill = true;
 
-    lv_obj_set_style_bg_color(parent, lv_color_hex(0x0A0A1A), 0);
+    lv_obj_set_style_bg_color(parent, lv_color_hex(0x000000), 0);
 
-    // Header
-    lv_obj_t* header = lv_obj_create(parent);
-    lv_obj_set_size(header, LV_PCT(100), 32);
-    lv_obj_set_style_bg_color(header, theme_color_panel(), 0);
-    lv_obj_set_style_bg_opa(header, LV_OPA_80, 0);
-    lv_obj_set_style_border_width(header, 0, 0);
-    lv_obj_set_style_radius(header, 0, 0);
-    lv_obj_align(header, LV_ALIGN_TOP_MID, 0, 0);
+    // Canvas — во весь экран (видоискатель без шапки).
+    // Создаётся ДО статуса/плашек — они лежат поверх (z-order LVGL).
+    canvas_stride = lv_draw_buf_width_to_stride(IMG_W, LV_COLOR_FORMAT_RGB565);
+    size_t canvas_size = canvas_stride * IMG_H;
+    canvas_buf = (uint8_t*)ps_malloc(canvas_size);
+    if (!canvas_buf) canvas_buf = (uint8_t*)malloc(canvas_size);
+    if (!canvas_buf) {
+        // Статуса ещё нет — просто выходим
+        return;
+    }
+    memset(canvas_buf, 0, canvas_size);
 
-    lv_obj_t* lbl_title = lv_label_create(header);
-    lv_label_set_text_fmt(lbl_title, "%s %s",
-                          LV_SYMBOL_IMAGE, lang_str_camera_title());
-    lv_obj_set_style_text_color(lbl_title, theme_color_text(), 0);
-    lv_obj_set_style_text_font(lbl_title, &lv_font_cyr_14, 0);
-    lv_obj_align(lbl_title, LV_ALIGN_CENTER, 0, 0);
+    canvas = lv_canvas_create(parent);
+    lv_canvas_set_buffer(canvas, canvas_buf, IMG_W, IMG_H, LV_COLOR_FORMAT_RGB565);
+    lv_obj_align(canvas, LV_ALIGN_TOP_MID, 0, 0);
 
-    // Status
+    // Status — тёмная «таблетка» поверх картинки (читается на любом кадре)
     lbl_status = lv_label_create(parent);
     lv_label_set_text_fmt(lbl_status, "%s %s",
                           LV_SYMBOL_REFRESH, lang_str_camera_init());
-    lv_obj_set_style_text_color(lbl_status, theme_color_text_muted(), 0);
+    lv_obj_set_style_text_color(lbl_status, lv_color_white(), 0);
     lv_obj_set_style_text_font(lbl_status, &lv_font_cyr_14, 0);
-    lv_obj_align(lbl_status, LV_ALIGN_TOP_MID, 0, 38);
+    lv_obj_set_style_bg_color(lbl_status, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(lbl_status, LV_OPA_60, 0);
+    lv_obj_set_style_radius(lbl_status, 8, 0);
+    lv_obj_set_style_pad_all(lbl_status, 4, 0);
+    lv_obj_align(lbl_status, LV_ALIGN_TOP_MID, 0, 8);
 
     // Init camera
     if (!camera_init()) {
@@ -306,36 +400,27 @@ void camera_app_open(lv_obj_t* parent) {
         return;
     }
 
-    // Pre-allocate temp decode buffer for EIGHTH of UXGA (200x150)
-    temp_buf = (uint8_t*)ps_malloc(200 * 150 * 2);
+    // Буфер превью и метрики AF: 1/4 UXGA = 400x300 (чётко для текста)
+    temp_buf = (uint8_t*)ps_malloc(AF_W * AF_H * 2);
     if (!temp_buf) {
         lv_label_set_text_fmt(lbl_status, "%s %s",
                               LV_SYMBOL_WARNING, "No PSRAM");
         return;
     }
 
-    // Allocate canvas buffer with LVGL stride
-    canvas_stride = lv_draw_buf_width_to_stride(IMG_W, LV_COLOR_FORMAT_RGB565);
-    size_t canvas_size = canvas_stride * IMG_H;
-    canvas_buf = (uint8_t*)ps_malloc(canvas_size);
-    if (!canvas_buf) canvas_buf = (uint8_t*)malloc(canvas_size);
-    if (!canvas_buf) {
-        lv_label_set_text_fmt(lbl_status, "%s %s",
-                              LV_SYMBOL_WARNING, "No memory");
-        return;
-    }
-    memset(canvas_buf, 0, canvas_size);
-
-    canvas = lv_canvas_create(parent);
-    lv_canvas_set_buffer(canvas, canvas_buf, IMG_W, IMG_H, LV_COLOR_FORMAT_RGB565);
-    lv_obj_align(canvas, LV_ALIGN_TOP_MID, 0, HEADER_H + 2);
-
     preview_active = true;
+
+    // Автофокус при открытии: ~2-2.5 с, статус виден сразу
+    lv_label_set_text_fmt(lbl_status, "%s %s",
+                          LV_SYMBOL_REFRESH, lang_str_camera_focusing());
+    lv_refr_now(lv_display_get_default());
+    cam_focus = run_autofocus(cam_focus);
+
     lv_label_set_text_fmt(lbl_status, "%s %s  |  B:%d F:%d",
                           LV_SYMBOL_IMAGE, lang_str_camera_ready(),
                           cam_brightness, cam_focus);
 
-    // 100ms timer = ~10 FPS preview
+    // 100ms timer — предпросмотр; декод 1/4 дороже EIGHTH, ~7-9 FPS
     refresh_timer = lv_timer_create(refresh_cb, 100, nullptr);
 }
 
@@ -375,6 +460,20 @@ static void schedule_resume(uint32_t delay_ms) {
 }
 
 void camera_app_button(int button_id, int event) {
+    // Долгое нажатие любой кнопки навигации (OK-long перехватывает main —
+    // выход из приложения): переключение режима превью
+    // «во всю ширину» (кроп сверху/снизу) ⇄ «весь кадр» (поля по бокам).
+    if (event == BTN_EVENT_LONG_PRESSED) {
+        if (button_id == BTN_ID_OK) return;
+        if (saving) return;
+        preview_fill = !preview_fill;
+        toast_set(preview_fill ? lang_str_camera_mode_fill()
+                               : lang_str_camera_mode_fit(),
+                  lv_color_hex(0x3A3A3A));
+        schedule_resume(1500);
+        return;
+    }
+
     if (event != BTN_EVENT_CLICKED) return;
 
     if (button_id == BTN_ID_OK) {
@@ -383,7 +482,15 @@ void camera_app_button(int button_id, int event) {
         preview_active = false;
         saving = true;
 
-        // Плашка появляется сразу при нажатии — видно, что фото снято
+        // 1) Сначала автофокус — чтобы текст в файле был читаем.
+        //    Плашка появляется мгновенно: видно, что нажатие сработало.
+        toast_set(lang_str_camera_focusing(), lv_color_hex(0x2C6FBF));
+        lv_label_set_text_fmt(lbl_status, "%s %s",
+                              LV_SYMBOL_REFRESH, lang_str_camera_focusing());
+        lv_refr_now(lv_display_get_default());
+        cam_focus = run_autofocus(cam_focus);
+
+        // 2) Плашка «Снято» — фото будет сохранено
         toast_set(lang_str_camera_captured(), lv_color_hex(0x1B7F3B));
         lv_label_set_text_fmt(lbl_status, "%s %s",
                               LV_SYMBOL_REFRESH, lang_str_camera_captured());
@@ -400,10 +507,10 @@ void camera_app_button(int button_id, int event) {
             return;
         }
 
-        // Показать захват на экране (EIGHTH scale, вписан 1:1)
+        // Показать захват на экране (1/4 scale, как предпросмотр)
         int dec_w = 0, dec_h = 0;
         if (jpeg_decode_to_rgb565(jpeg_buf, jpeg_len,
-                                  temp_buf, 200, 150, 200 * 2, 8,
+                                  temp_buf, AF_W, AF_H, AF_W * 2, 4,
                                   &dec_w, &dec_h)) {
             if (dec_w > 0 && dec_h > 0) {
                 scale_image((uint16_t*)temp_buf, dec_w, dec_h,

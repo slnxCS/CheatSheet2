@@ -39,9 +39,12 @@ static void on_button(ButtonId id, ButtonEvent event) {
             ui_manager_reload_home();
             return;
         }
-        // PRESSED тоже пробрасываем — игры (Flappy) реагируют на нажатие,
-        // остальные приложения фильтруют по BTN_EVENT_CLICKED
-        if (event == BTN_EVENT_CLICKED || event == BTN_EVENT_PRESSED) {
+        // PRESSED и LONG_PRESSED тоже пробрасываем: PRESSED — игры (Flappy)
+        // реагируют на нажатие, LONG (кроме OK — он выходит из приложения) —
+        // переключение режима превью в камере. Остальные приложения
+        // фильтруют по BTN_EVENT_CLICKED.
+        if (event == BTN_EVENT_CLICKED || event == BTN_EVENT_PRESSED ||
+            event == BTN_EVENT_LONG_PRESSED) {
             AppContext* app = app_registry_get_running();
             if (app && app->on_button) {
                 app->on_button((int)id, (int)event);
