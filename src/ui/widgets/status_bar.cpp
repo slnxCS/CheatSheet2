@@ -1,6 +1,7 @@
 #include "fonts/fonts.h"
 #include "ui/widgets/status_bar.h"
 #include "ui/theme.h"
+#include "services/wifi_service.h"
 #include <WiFi.h>
 
 static lv_obj_t* bar_obj = nullptr;
@@ -45,9 +46,9 @@ void status_bar_set_time(const char* time_str) {
 }
 
 void status_bar_update() {
-    if (!wifi_connected && WiFi.status() == WL_CONNECTED) {
-        status_bar_set_wifi(true);
-    } else if (wifi_connected && WiFi.status() != WL_CONNECTED) {
-        status_bar_set_wifi(false);
+    // AP-режим (wifi_service) или STA — иконка яркая в обоих случаях
+    bool on = wifi_service_running() || WiFi.status() == WL_CONNECTED;
+    if (on != wifi_connected) {
+        status_bar_set_wifi(on);
     }
 }

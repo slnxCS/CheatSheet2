@@ -13,15 +13,20 @@
 #include "apps/builtin/game_2048.h"
 #include "apps/builtin/tetris_game.h"
 #include "apps/builtin/flappy_game.h"
+#include "apps/builtin/ai_answer_app.h"
 #include "services/lang_service.h"
 #include "services/storage_service.h"
 #include "services/battery_service.h"
+#include "services/wifi_service.h"
+#include "services/ai_link.h"
+#include "ui/app_host.h"
 #include "ui/theme.h"
 #include "SD_MMC.h"
 #include "LittleFS.h"
 
 static bool in_app = false;
 static int current_app_idx = -1;
+static int ai_app_idx = -1;
 
 static void init_fs() {
     storage_set_constrain(LittleFS.begin(true) ? 0 : -1);
@@ -30,13 +35,42 @@ static void init_fs() {
     storage_set_constrain(SD_MMC.begin("/sdcard", true) ? 1 : 0);
 }
 
+static void host_open(int idx) {
+    current_app_idx = idx;
+    in_app = true;
+    ui_manager_switch(SCREEN_APP);
+    app_registry_open(idx, lv_screen_active());
+}
+
+static void host_close_to_home() {
+    app_registry_close(current_app_idx);
+    in_app = false;
+    current_app_idx = -1;
+    ui_manager_reload_home();
+}
+
+// --- app_host: программное открытие (ai_link → экран «ИИ») ---
+
+void app_host_open_index(int idx) {
+    if (idx < 0 || idx >= app_registry_count()) return;
+    if (in_app) {
+        if (current_app_idx == idx) return;
+        // Переключение: закрыть текущее приложение без возврата на домой
+        app_registry_close(current_app_idx);
+        current_app_idx = -1;
+        in_app = false;
+    }
+    host_open(idx);
+}
+
+bool app_host_in_app() { return in_app; }
+int  app_host_current() { return current_app_idx; }
+int  app_host_ai_index() { return ai_app_idx; }
+
 static void on_button(ButtonId id, ButtonEvent event) {
     if (in_app) {
         if (id == BTN_ID_OK && event == BTN_EVENT_LONG_PRESSED) {
-            app_registry_close(current_app_idx);
-            in_app = false;
-            current_app_idx = -1;
-            ui_manager_reload_home();
+            host_close_to_home();
             return;
         }
         // PRESSED и LONG_PRESSED тоже пробрасываем: PRESSED — игры (Flappy)
@@ -75,10 +109,7 @@ static void on_button(ButtonId id, ButtonEvent event) {
             if (selected < count - 1) selected++;
             break;
         case BTN_ID_OK:
-            current_app_idx = selected;
-            in_app = true;
-            ui_manager_switch(SCREEN_APP);
-            app_registry_open(selected, lv_screen_active());
+            host_open(selected);
             return;
         default:
             break;
@@ -130,6 +161,9 @@ void setup() {
     app_registry_add("2048", LV_SYMBOL_PLAY, game_2048_open, game_2048_close, game_2048_button);
     app_registry_add("Tetris", LV_SYMBOL_PLAY, tetris_game_open, tetris_game_close, tetris_game_button);
     app_registry_add("Flappy", LV_SYMBOL_PLAY, flappy_game_open, flappy_game_close, flappy_game_button);
+    ai_app_idx = app_registry_add(lang_str_app_ai(), LV_SYMBOL_EDIT,
+                                  ai_answer_app_open, ai_answer_app_close,
+                                  ai_answer_app_button);
     Serial.printf("[3/6] Apps registered: %d\n", app_registry_count());
 
     Serial.println("[4/6] UI...");
@@ -148,6 +182,12 @@ void setup() {
     Serial.println("[6/6] Boot complete!");
 
     init_fs();
+
+    // WiFi SoftAP («CSCAM») + HTTP-мост «устройство → телефон → ИИ»
+    Serial.println("[7/7] WiFi + AI link...");
+    wifi_service_init();
+    ai_link_init();
+    Serial.println("[7/7] WiFi + AI link DONE");
 }
 
 static unsigned long last_tick = 0;

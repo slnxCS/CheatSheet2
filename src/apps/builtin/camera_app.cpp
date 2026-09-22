@@ -4,6 +4,7 @@
 #include "drivers/jpeg_decoder.h"
 #include "drivers/input.h"
 #include "services/lang_service.h"
+#include "services/ai_link.h"
 #include "services/storage_service.h"
 #include "ui/theme.h"
 #include <Arduino.h>
@@ -434,6 +435,9 @@ static bool save_photo(const uint8_t* jpeg_data, size_t jpeg_len, size_t* out_si
     free(tbuf);
 
     Serial.printf("Saved %s (%d bytes, %dx%d)\n", path, (int)(out_size ? *out_size : 0), out_w, out_h);
+
+    // Поставить фото в очередь на передачу телефону (HTTP-мост к ИИ)
+    ai_link_notify_photo(fs, path);
     return true;
 }
 

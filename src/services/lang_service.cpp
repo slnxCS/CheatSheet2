@@ -8,7 +8,11 @@ struct LangStrings {
     const char* app_camera;
     const char* app_settings;
     const char* app_explorer;
+    const char* app_ai;
     const char* settings_title;
+    const char* settings_wifi;
+    const char* wifi_on;
+    const char* wifi_off;
     const char* settings_brightness;
     const char* settings_language;
     const char* settings_storage;
@@ -28,13 +32,21 @@ struct LangStrings {
     const char* explorer_select;
     const char* explorer_back;
     const char* explorer_open;
+    const char* ai_nothing;
+    const char* ai_pending;
+    const char* ai_taken;
+    const char* ai_answered;
 };
 
 static const LangStrings lang_en = {
     .app_camera      = "Camera",
     .app_settings    = "Settings",
     .app_explorer    = "Explorer",
+    .app_ai          = "AI",
     .settings_title  = "Settings",
+    .settings_wifi   = "WiFi network",
+    .wifi_on         = "On",
+    .wifi_off        = "Off",
     .settings_brightness = "Brightness",
     .settings_language   = "Language",
     .settings_storage    = "Storage",
@@ -54,13 +66,21 @@ static const LangStrings lang_en = {
     .explorer_select = "select",
     .explorer_back   = "back",
     .explorer_open   = "open",
+    .ai_nothing  = "No photo. Take a photo in the camera.",
+    .ai_pending  = "Photo taken. Open the app on your phone.",
+    .ai_taken    = "Sent to AI - waiting for the answer...",
+    .ai_answered = "Answer received",
 };
 
 static const LangStrings lang_ru = {
     .app_camera      = "Камера",
     .app_settings    = "Настройки",
     .app_explorer    = "Проводник",
+    .app_ai          = "ИИ",
     .settings_title  = "Настройки",
+    .settings_wifi   = "WiFi сеть",
+    .wifi_on         = "Вкл",
+    .wifi_off        = "Выкл",
     .settings_brightness = "Яркость",
     .settings_language   = "Язык",
     .settings_storage    = "Накопитель",
@@ -80,6 +100,10 @@ static const LangStrings lang_ru = {
     .explorer_select = "выбор",
     .explorer_back   = "назад",
     .explorer_open   = "открыть",
+    .ai_nothing  = "Нет фото. Снимите фото в камере.",
+    .ai_pending  = "Фото снято. Откройте приложение на телефоне.",
+    .ai_taken    = "Отправлено в ИИ - жду ответ...",
+    .ai_answered = "Ответ получен",
 };
 
 static const LangStrings* langs[LANG_COUNT] = {
@@ -129,6 +153,16 @@ const char* lang_str_camera_focusing(){ return langs[current_lang]->camera_focus
 const char* lang_str_camera_mode_fill(){ return langs[current_lang]->camera_mode_fill; }
 const char* lang_str_camera_mode_fit() { return langs[current_lang]->camera_mode_fit; }
 const char* lang_str_app_explorer()   { return langs[current_lang]->app_explorer; }
+const char* lang_str_app_ai()         { return langs[current_lang]->app_ai; }
+const char* lang_str_settings_wifi()  { return langs[current_lang]->settings_wifi; }
+const char* lang_str_ai_nothing()     { return langs[current_lang]->ai_nothing; }
+const char* lang_str_ai_pending()     { return langs[current_lang]->ai_pending; }
+const char* lang_str_ai_taken()       { return langs[current_lang]->ai_taken; }
+const char* lang_str_ai_answered()    { return langs[current_lang]->ai_answered; }
+
+const char* lang_str_settings_wifi_name(bool on) {
+    return on ? langs[current_lang]->wifi_on : langs[current_lang]->wifi_off;
+}
 const char* lang_str_explorer_title() { return langs[current_lang]->explorer_title; }
 const char* lang_str_explorer_flash() { return langs[current_lang]->explorer_flash; }
 const char* lang_str_explorer_sdcard(){ return langs[current_lang]->explorer_sdcard; }

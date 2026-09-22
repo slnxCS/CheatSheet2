@@ -31,8 +31,10 @@
 - [x] camera driver (OV5640, JPEG, PSRAM)
 - [x] camera app (просмотр + авто-обновление)
 - [x] settings app (яркость слайдер)
-- [ ] WiFi service (HTTP server для связи с телефоном)
-- [ ] WiFi transfer app (отправка JPEG на телефон)
+- [x] WiFi service (HTTP server для связи с телефоном)
+- [x] WiFi transfer app (отправка JPEG на телефон)
+- [x] ai_link (SoftAP «CSCAM» + HTTP: фото → телефон, ответ ИИ → экран)
+- [ ] Android-приложение-мост (забрать фото, спросить ИИ, вернуть ответ)
 
 ### Phase 3: Polish
 - [ ] OTA service
@@ -58,5 +60,5 @@ src/
 - WiFi (встроенная)
 
 ## Статус сборки
-- RAM:   [===       ]  27.8% (90956 / 327680 bytes)
-- Flash: [==        ]  21.4% (673809 / 3145728 bytes)
+- RAM:   40.9% (134040 / 327680 bytes)
+- Flash: 53.1% (1390969 / 2621440 bytes)

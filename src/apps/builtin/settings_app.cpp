@@ -3,6 +3,7 @@
 #include "apps/builtin/settings_app.h"
 #include "services/lang_service.h"
 #include "services/storage_service.h"
+#include "services/wifi_service.h"
 #include "ui/theme.h"
 #include "drivers/display.h"
 #include <cstdio>
@@ -15,9 +16,12 @@ static lv_obj_t* row_brightness = nullptr;
 static lv_obj_t* row_lang = nullptr;
 static lv_obj_t* row_storage = nullptr;
 static lv_obj_t* lbl_storage_val = nullptr;
+static lv_obj_t* row_wifi = nullptr;
+static lv_obj_t* lbl_wifi_val = nullptr;
 static int current_item = 0;
 static int current_storage = 0; // 0 = Flash, 1 = SD Card (loaded from NVS)
-static const int ITEM_COUNT = 3;
+static bool current_wifi = false;
+static const int ITEM_COUNT = 4;
 
 static void highlight_items() {
     if (row_brightness) {
@@ -31,6 +35,10 @@ static void highlight_items() {
     if (row_storage) {
         lv_obj_set_style_bg_opa(row_storage,
             (current_item == 2) ? LV_OPA_20 : LV_OPA_TRANSP, 0);
+    }
+    if (row_wifi) {
+        lv_obj_set_style_bg_opa(row_wifi,
+            (current_item == 3) ? LV_OPA_20 : LV_OPA_TRANSP, 0);
     }
 }
 
@@ -65,6 +73,12 @@ void settings_app_button(int button_id, int event) {
             if (lbl_storage_val)
                 lv_label_set_text(lbl_storage_val,
                     lang_str_settings_storage_name(current_storage));
+        } else if (current_item == 3) {
+            wifi_service_set_enabled(!current_wifi);
+            current_wifi = wifi_service_enabled();
+            if (lbl_wifi_val)
+                lv_label_set_text(lbl_wifi_val,
+                    lang_str_settings_wifi_name(current_wifi));
         }
     } else if (button_id == BTN_ID_LEFT) {
         if (current_item == 0 && slider_brightness) {
@@ -86,6 +100,12 @@ void settings_app_button(int button_id, int event) {
             if (lbl_storage_val)
                 lv_label_set_text(lbl_storage_val,
                     lang_str_settings_storage_name(current_storage));
+        } else if (current_item == 3) {
+            wifi_service_set_enabled(!current_wifi);
+            current_wifi = wifi_service_enabled();
+            if (lbl_wifi_val)
+                lv_label_set_text(lbl_wifi_val,
+                    lang_str_settings_wifi_name(current_wifi));
         }
     }
 }
@@ -105,6 +125,7 @@ void settings_app_open(lv_obj_t* parent) {
     parent_ref = parent;
     current_item = 0;
     current_storage = storage_get(); // Load from NVS
+    current_wifi = wifi_service_enabled();
 
     lv_obj_set_style_bg_color(parent, lv_color_hex(0x0A1628), 0);
 
@@ -228,6 +249,36 @@ void settings_app_open(lv_obj_t* parent) {
     lv_obj_set_style_text_color(lbl_storage_val, theme_color_accent(), 0);
     lv_obj_set_style_text_font(lbl_storage_val, &lv_font_cyr_14, 0);
 
+    // Separator
+    lv_obj_t* sep3 = lv_obj_create(section);
+    lv_obj_set_size(sep3, LV_PCT(100), 1);
+    lv_obj_set_style_bg_color(sep3, theme_color_text_muted(), 0);
+    lv_obj_set_style_bg_opa(sep3, LV_OPA_30, 0);
+    lv_obj_set_style_border_width(sep3, 0, 0);
+    lv_obj_set_style_pad_all(sep3, 0, 0);
+
+    // --- WiFi (SoftAP для связи с телефоном) ---
+    lv_obj_t* lbl_wifi_hdr = lv_label_create(section);
+    lv_label_set_text_fmt(lbl_wifi_hdr, "%s %s",
+                          LV_SYMBOL_WIFI, lang_str_settings_wifi());
+    lv_obj_set_style_text_color(lbl_wifi_hdr, theme_color_text(), 0);
+    lv_obj_set_style_text_font(lbl_wifi_hdr, &lv_font_cyr_14, 0);
+
+    row_wifi = lv_obj_create(section);
+    lv_obj_set_size(row_wifi, LV_PCT(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(row_wifi, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_bg_color(row_wifi, theme_color_accent(), 0);
+    lv_obj_set_style_border_width(row_wifi, 0, 0);
+    lv_obj_set_style_pad_all(row_wifi, 4, 0);
+    lv_obj_set_flex_flow(row_wifi, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row_wifi, LV_FLEX_ALIGN_END,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lbl_wifi_val = lv_label_create(row_wifi);
+    lv_label_set_text(lbl_wifi_val, lang_str_settings_wifi_name(current_wifi));
+    lv_obj_set_style_text_color(lbl_wifi_val, theme_color_accent(), 0);
+    lv_obj_set_style_text_font(lbl_wifi_val, &lv_font_cyr_14, 0);
+
     highlight_items();
 }
 
@@ -240,4 +291,6 @@ void settings_app_close() {
     row_lang = nullptr;
     row_storage = nullptr;
     lbl_storage_val = nullptr;
+    row_wifi = nullptr;
+    lbl_wifi_val = nullptr;
 }
