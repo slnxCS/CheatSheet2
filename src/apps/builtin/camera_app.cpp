@@ -74,6 +74,20 @@ static int cam_focus = 512;      // 0..1023
 static bool preview_fill = true; // true = во всю ширину (кроп сверху/снизу),
                                  // false = весь кадр (чёрные поля по бокам)
 
+// --- Декод превью в отдельной задаче (core 0) ---
+// Декод 1/4 UXGA занимает ~100+ мс. Раньше он шёл в потоке LVGL — каждый тик
+// таймера «замораживал» интерфейс (кнопки/плашки отставали). Теперь LVGL только
+// выдаёт кадр воркеру и показывает готовый буфер (смена указателя, без копий),
+// а JPEGDEC + scale идут на втором ядре.
+static TaskHandle_t pv_task = nullptr;
+static volatile bool pv_stop = false;
+static uint8_t* work_buf = nullptr;          // второй canvas-буфер: сюда пишет воркер
+static volatile bool job_ready = false;      // кадр выдан воркеру (fb у воркера)
+static volatile bool job_done = false;       // work_buf готов к показу
+static uint8_t* job_fb = nullptr;
+static size_t job_len = 0;
+static portMUX_TYPE pv_mux = portMUX_INITIALIZER_UNLOCKED;
+
 // Транспонирование (оси X/Y swapped — сенсор физически повёрнут) +
 // вписывание (fit) или заполнение экрана (fill) с сохранением пропорций.
 // fill: картинка идёт во всю ширину, лишнее сверху/снизу обрезается по центру.
@@ -132,32 +146,100 @@ static void scale_image(const uint16_t* src, int src_w, int src_h,
     }
 }
 
-// --- Preview timer callback ---
+// --- Preview timer: только выдача кадров и показ готового (декод — в pv_task_fn) ---
 static void refresh_cb(lv_timer_t* timer) {
     if (!parent_ref || !lbl_status || !preview_active || !canvas || !canvas_buf) return;
 
+    // 1) Готовый кадр воркера: показать его и решить, выдавать ли новый.
+    //    Всё в одном критическом участке — иначе гонка «ready сброшен,
+    //    а done ещё не виден» привела бы к выдаче нового кадра поверх
+    //    не показанного (рваная картинка).
+    bool done = false;
+    bool issue = false;
+    portENTER_CRITICAL(&pv_mux);
+    done = job_done;
+    if (done) job_done = false;
+    issue = !job_ready && !job_done;
+    portEXIT_CRITICAL(&pv_mux);
+
+    if (done) {
+        // Поменять показываемый и рабочий буферы местами (без копирования)
+        uint8_t* tmp = canvas_buf;
+        canvas_buf = work_buf;
+        work_buf = tmp;
+        lv_canvas_set_buffer(canvas, canvas_buf, IMG_W, IMG_H, LV_COLOR_FORMAT_RGB565);
+        lv_obj_invalidate(canvas);
+    }
+
+    if (!issue) return;
+
+    // 2) Снять свежий кадр и отдать воркеру
     uint8_t* jpeg_buf = nullptr;
     size_t jpeg_len = 0;
-
     if (!camera_capture(&jpeg_buf, &jpeg_len)) {
         lv_label_set_text_fmt(lbl_status, "%s %s",
                               LV_SYMBOL_WARNING, lang_str_camera_no_camera());
         return;
     }
 
-    // Preview: QUARTER scale of 1600x1200 = 400x300 (чётко для чтения текста)
-    int dec_w = 0, dec_h = 0;
-    if (jpeg_decode_to_rgb565(jpeg_buf, jpeg_len,
-                              temp_buf, AF_W, AF_H, AF_W * 2, 4,
-                              &dec_w, &dec_h)) {
-        if (dec_w > 0 && dec_h > 0) {
-            scale_image((uint16_t*)temp_buf, dec_w, dec_h,
-                        (uint16_t*)canvas_buf, IMG_W, IMG_H, canvas_stride);
-            lv_obj_invalidate(canvas);
+    portENTER_CRITICAL(&pv_mux);
+    job_fb = jpeg_buf;
+    job_len = jpeg_len;
+    job_ready = true;
+    portEXIT_CRITICAL(&pv_mux);
+    if (pv_task) xTaskNotifyGive(pv_task);
+}
+
+// Дождаться, пока воркер закончит текущий кадр: он держит fb камеры
+// и использует temp_buf. Нужно перед автофокусом/снимком.
+static void wait_preview_idle() {
+    uint32_t t0 = millis();
+    while (job_ready && millis() - t0 < 1500) {
+        delay(10);
+    }
+}
+
+// Воркер превью: core 0. Декодирует кадр (1/4 UXGA) и пишет в work_buf.
+static void pv_task_fn(void* arg) {
+    (void)arg;
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(30));
+        if (pv_stop) break;
+
+        uint8_t* fb = nullptr;
+        size_t len = 0;
+        bool have = false;
+
+        portENTER_CRITICAL(&pv_mux);
+        if (job_ready) { fb = job_fb; len = job_len; have = true; }
+        portEXIT_CRITICAL(&pv_mux);
+        if (!have) continue;
+
+        int dw = 0, dh = 0;
+        bool ok = jpeg_decode_to_rgb565(fb, len, temp_buf,
+                                        AF_W, AF_H, AF_W * 2, 4, &dw, &dh);
+        camera_release();   // fb можно вернуть сразу после декода
+        if (ok && dw > 0 && dh > 0) {
+            scale_image((uint16_t*)temp_buf, dw, dh,
+                        (uint16_t*)work_buf, IMG_W, IMG_H, canvas_stride);
         }
+
+        portENTER_CRITICAL(&pv_mux);
+        job_ready = false;  // temp_buf и fb снова свободны
+        job_done  = true;
+        portEXIT_CRITICAL(&pv_mux);
     }
 
-    camera_release();
+    // Остановка: если кадр был взят, но не обработан — вернуть fb
+    bool leak = false;
+    portENTER_CRITICAL(&pv_mux);
+    leak = job_ready;
+    if (leak) job_ready = false;
+    portEXIT_CRITICAL(&pv_mux);
+    if (leak) camera_release();
+
+    pv_task = nullptr;
+    vTaskDelete(nullptr);
 }
 
 // --- Контрастный автофокус (CDAF) ---
@@ -367,15 +449,22 @@ void camera_app_open(lv_obj_t* parent) {
 
     // Canvas — во весь экран (видоискатель без шапки).
     // Создаётся ДО статуса/плашек — они лежат поверх (z-order LVGL).
+    // Два буфера: canvas_buf (показывается) и work_buf (пишет воркер) —
+    // они меняются местами без копирования.
     canvas_stride = lv_draw_buf_width_to_stride(IMG_W, LV_COLOR_FORMAT_RGB565);
     size_t canvas_size = canvas_stride * IMG_H;
     canvas_buf = (uint8_t*)ps_malloc(canvas_size);
     if (!canvas_buf) canvas_buf = (uint8_t*)malloc(canvas_size);
-    if (!canvas_buf) {
+    work_buf = (uint8_t*)ps_malloc(canvas_size);
+    if (!work_buf) work_buf = (uint8_t*)malloc(canvas_size);
+    if (!canvas_buf || !work_buf) {
         // Статуса ещё нет — просто выходим
+        if (canvas_buf) { free(canvas_buf); canvas_buf = nullptr; }
+        if (work_buf) { free(work_buf); work_buf = nullptr; }
         return;
     }
     memset(canvas_buf, 0, canvas_size);
+    memset(work_buf, 0, canvas_size);
 
     canvas = lv_canvas_create(parent);
     lv_canvas_set_buffer(canvas, canvas_buf, IMG_W, IMG_H, LV_COLOR_FORMAT_RGB565);
@@ -420,7 +509,11 @@ void camera_app_open(lv_obj_t* parent) {
                           LV_SYMBOL_IMAGE, lang_str_camera_ready(),
                           cam_brightness, cam_focus);
 
-    // 100ms timer — предпросмотр; декод 1/4 дороже EIGHTH, ~7-9 FPS
+    // Воркер декода превью на втором ядре — LVGL не блокируется
+    pv_stop = false;
+    xTaskCreatePinnedToCore(pv_task_fn, "cam_prev", 8192, nullptr, 1, &pv_task, 0);
+
+    // 100ms timer — предпросмотр; декод идёт в воркере, UI не тормозит
     refresh_timer = lv_timer_create(refresh_cb, 100, nullptr);
 }
 
@@ -429,9 +522,23 @@ void camera_app_close() {
         lv_timer_del(refresh_timer);
         refresh_timer = nullptr;
     }
+
+    // Остановить воркер превью и дождаться его выхода (fb и temp_buf
+    // принадлежат ему, деинициализация камеры — только после остановки)
+    pv_stop = true;
+    if (pv_task) {
+        xTaskNotifyGive(pv_task);
+        uint32_t t0 = millis();
+        while (pv_task && millis() - t0 < 1500) {
+            delay(10);
+        }
+    }
+    pv_stop = false;
+
     camera_deinit();
 
     if (canvas_buf) { free(canvas_buf); canvas_buf = nullptr; }
+    if (work_buf) { free(work_buf); work_buf = nullptr; }
     if (temp_buf) { free(temp_buf); temp_buf = nullptr; }
 
     parent_ref = nullptr;
@@ -481,6 +588,9 @@ void camera_app_button(int button_id, int event) {
 
         preview_active = false;
         saving = true;
+
+        // Дождаться воркера: он держит fb камеры и использует temp_buf
+        wait_preview_idle();
 
         // 1) Сначала автофокус — чтобы текст в файле был читаем.
         //    Плашка появляется мгновенно: видно, что нажатие сработало.
