@@ -539,7 +539,7 @@ class MainActivity : Activity() {
             when (provider) {
                 "openai"     -> "gpt-4o-mini"
                 "openrouter" -> "qwen/qwen3.8-27b:free"   // бесплатная, с картинками
-                else         -> "gemini-2.5-flash-lite"   // бесплатный тариф AI Studio
+                else         -> "gemini-3.6-flash"        // бесплатный тариф AI Studio
             }
         }
 
@@ -679,7 +679,7 @@ class MainActivity : Activity() {
             text = "Модель"; setPadding(0, dp(12), 0, 0)
         })
         val modelEdit = EditText(this).apply {
-            hint = "пусто = по умолчанию (gemini-2.5-flash-lite / " +
+            hint = "пусто = по умолчанию (gemini-3.6-flash / " +
                    "gpt-4o-mini / qwen3.8-27b:free)"
             setText(prefs.getString("model", ""))
         }
