@@ -75,6 +75,8 @@ class MainActivity : Activity() {
     private var reconnectPending = false  // запланировано авто-переподключение
     private var bindFails = 0             // окно счётчика EPERM (шторм = ребуты ESP)
     private var bindFailsWin = 0L
+    @Volatile private var lastAvailableAt = 0L       // время onAvailable, мс
+    @Volatile private var lostSeenSinceAvail = false // был ли onLost после него
 
     private val prefs by lazy { getSharedPreferences("camlink", Context.MODE_PRIVATE) }
 
@@ -242,14 +244,20 @@ class MainActivity : Activity() {
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 espNetwork = network
-                log("✔ Подключено к устройству ($ssid)")
+                lastAvailableAt = System.currentTimeMillis()
+                lostSeenSinceAvail = false
+                log("✔ Подключено к устройству ($ssid) [сеть $network]")
                 status("Подключено — чат на устройстве")
                 mainHandler.post { btnQuick.isEnabled = true }
             }
 
             override fun onLost(network: Network) {
+                lostSeenSinceAvail = true
+                val since = if (lastAvailableAt > 0)
+                    "${System.currentTimeMillis() - lastAvailableAt} мс после подключения"
+                else "вне подключения"
                 if (espNetwork == network) espNetwork = null
-                log("✖ Связь с устройством потеряна (ждите переподключения)")
+                log("✖ onLost [сеть $network] — $since")
                 status("Нет связи — жду переподключения…")
                 mainHandler.post { btnQuick.isEnabled = false }
                 scheduleAutoReconnect()
@@ -313,7 +321,15 @@ class MainActivity : Activity() {
     // старую ссылку и дать цепочке восстановиться
     private fun invalidateEsp(reason: String) {
         mainHandler.post {
+            // Диагностика: если onLost НЕ был — линк формально жив, а
+            // привязку запрещает система (VPN/файрвол/OEM). Если был —
+            // сеть реально упала сразу после выдачи handle.
+            val since = if (lastAvailableAt > 0)
+                "onAvailable был ${System.currentTimeMillis() - lastAvailableAt} мс назад"
+            else "onAvailable не было"
+            val lost = if (lostSeenSinceAvail) "onLost: был" else "onLost: НЕ был"
             log("! Связь прервана: $reason")
+            log("  └ $since; $lost")
             espNetwork = null
             btnQuick.isEnabled = false
             status("Переподключение к устройству…")
