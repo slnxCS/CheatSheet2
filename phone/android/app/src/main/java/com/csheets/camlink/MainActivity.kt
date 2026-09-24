@@ -535,10 +535,21 @@ class MainActivity : Activity() {
         val key = prefs.getString("key", "")!!
         if (key.isBlank()) throw IOException("нет API-ключа (⚙ Настройки)")
         val provider = prefs.getString("provider", "gemini")!!
+        val model = prefs.getString("model", "")!!.ifBlank {
+            when (provider) {
+                "openai"     -> "gpt-4o-mini"
+                "openrouter" -> "qwen/qwen3.8-27b:free"   // бесплатная, с картинками
+                else         -> "gemini-2.5-flash-lite"   // бесплатный тариф AI Studio
+            }
+        }
+
+        val openAiUrl =
+            if (provider == "openrouter") "https://openrouter.ai/api/v1/chat/completions"
+            else "https://api.openai.com/v1/chat/completions"
 
         if (photo == null) {   // текстовый вопрос
-            return if (provider == "openai") openAiText(key, userText)
-                   else geminiText(key, userText)
+            return if (provider == "gemini") geminiText(key, userText, model)
+                   else openAiText(key, userText, openAiUrl, model)
         }
 
         // Фото: промпт-инструкция (+ вопрос пользователя, если был набран)
@@ -547,8 +558,8 @@ class MainActivity : Activity() {
             if (userText.isEmpty()) prompt else "$prompt\n\nВопрос: $userText"
         val resized = resize(photo, 1568, 85)
         val b64 = Base64.encodeToString(resized, Base64.NO_WRAP)
-        return if (provider == "openai") callOpenAi(key, visionPrompt, b64)
-               else callGemini(key, visionPrompt, b64)
+        return if (provider == "gemini") callGemini(key, visionPrompt, b64, model)
+               else callOpenAi(key, visionPrompt, b64, openAiUrl, model)
     }
 
     private fun postJson(urlStr: String, json: JSONObject,
@@ -576,47 +587,50 @@ class MainActivity : Activity() {
         return JSONObject(text)
     }
 
-    private fun openAiText(key: String, text: String): String {
+    private fun openAiText(key: String, text: String,
+                           url: String, model: String): String {
         val body = JSONObject()
-            .put("model", "gpt-4o-mini")
+            .put("model", model)
             .put("max_tokens", 1200)
             .put("messages", JSONArray().put(
                 JSONObject().put("role", "user").put("content", text)))
-        val resp = postJson("https://api.openai.com/v1/chat/completions", body,
+        val resp = postJson(url, body,
             mapOf("Authorization" to "Bearer $key"))
         return resp.getJSONArray("choices")
             .getJSONObject(0).getJSONObject("message").getString("content")
     }
 
-    private fun geminiText(key: String, text: String): String {
+    private fun geminiText(key: String, text: String, model: String): String {
         val body = JSONObject().put("contents", JSONArray().put(
             JSONObject().put("role", "user")
                 .put("parts", JSONArray().put(JSONObject().put("text", text)))))
         val resp = postJson(
             "https://generativelanguage.googleapis.com/v1beta/models/" +
-            "gemini-2.0-flash:generateContent?key=$key", body)
+            "$model:generateContent?key=$key", body)
         val cand = resp.getJSONArray("candidates").getJSONObject(0)
         return cand.getJSONObject("content").getJSONArray("parts")
             .getJSONObject(0).getString("text")
     }
 
-    private fun callOpenAi(key: String, prompt: String, b64: String): String {
+    private fun callOpenAi(key: String, prompt: String, b64: String,
+                          url: String, model: String): String {
         val content = JSONArray()
             .put(JSONObject().put("type", "text").put("text", prompt))
             .put(JSONObject().put("type", "image_url")
                 .put("image_url", JSONObject().put("url", "data:image/jpeg;base64,$b64")))
         val body = JSONObject()
-            .put("model", "gpt-4o-mini")
+            .put("model", model)
             .put("max_tokens", 1200)
             .put("messages", JSONArray().put(
                 JSONObject().put("role", "user").put("content", content)))
-        val resp = postJson("https://api.openai.com/v1/chat/completions", body,
+        val resp = postJson(url, body,
             mapOf("Authorization" to "Bearer $key"))
         return resp.getJSONArray("choices")
             .getJSONObject(0).getJSONObject("message").getString("content")
     }
 
-    private fun callGemini(key: String, prompt: String, b64: String): String {
+    private fun callGemini(key: String, prompt: String, b64: String,
+                           model: String): String {
         val parts = JSONArray()
             .put(JSONObject().put("text", prompt))
             .put(JSONObject().put("inline_data",
@@ -625,7 +639,7 @@ class MainActivity : Activity() {
             JSONObject().put("role", "user").put("parts", parts)))
         val resp = postJson(
             "https://generativelanguage.googleapis.com/v1beta/models/" +
-            "gemini-2.0-flash:generateContent?key=$key", body)
+            "$model:generateContent?key=$key", body)
         val cand = resp.getJSONArray("candidates").getJSONObject(0)
         return cand.getJSONObject("content").getJSONArray("parts")
             .getJSONObject(0).getString("text")
@@ -643,8 +657,14 @@ class MainActivity : Activity() {
         val spinner = Spinner(this).apply {
             adapter = ArrayAdapter(context,
                 android.R.layout.simple_spinner_dropdown_item,
-                listOf("Google Gemini Flash", "OpenAI GPT-4o-mini"))
-            setSelection(if (prefs.getString("provider", "gemini") == "openai") 1 else 0)
+                listOf("Google Gemini Flash (бесплатный)",
+                       "OpenAI GPT-4o-mini",
+                       "OpenRouter (бесплатные модели)"))
+            setSelection(when (prefs.getString("provider", "gemini")) {
+                "openai" -> 1
+                "openrouter" -> 2
+                else -> 0
+            })
         }
         layout.addView(spinner)
 
@@ -654,6 +674,16 @@ class MainActivity : Activity() {
             setText(prefs.getString("key", ""))
         }
         layout.addView(keyEdit)
+
+        layout.addView(TextView(this).apply {
+            text = "Модель"; setPadding(0, dp(12), 0, 0)
+        })
+        val modelEdit = EditText(this).apply {
+            hint = "пусто = по умолчанию (gemini-2.5-flash-lite / " +
+                   "gpt-4o-mini / qwen3.8-27b:free)"
+            setText(prefs.getString("model", ""))
+        }
+        layout.addView(modelEdit)
 
         layout.addView(TextView(this).apply {
             text = "Промпт (для фото)"
@@ -689,8 +719,13 @@ class MainActivity : Activity() {
             .setView(scroll)
             .setPositiveButton("Сохранить") { _, _ ->
                 prefs.edit()
-                    .putString("provider", if (spinner.selectedItemPosition == 1) "openai" else "gemini")
+                    .putString("provider", when (spinner.selectedItemPosition) {
+                        1 -> "openai"
+                        2 -> "openrouter"
+                        else -> "gemini"
+                    })
                     .putString("key", keyEdit.text.toString().trim())
+                    .putString("model", modelEdit.text.toString().trim())
                     .putString("prompt", promptEdit.text.toString().trim())
                     .putString("ssid", ssidEdit.text.toString().trim())
                     .putString("pass", passEdit.text.toString().trim())
