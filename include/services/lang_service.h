@@ -27,6 +27,7 @@ const char* lang_str_camera_focusing();
 const char* lang_str_camera_mode_fill();
 const char* lang_str_camera_mode_fit();
 const char* lang_str_app_ai();
+const char* lang_str_ai_you();
 const char* lang_str_settings_wifi();
 const char* lang_str_settings_wifi_name(bool on);
 const char* lang_str_ai_nothing();

@@ -8,8 +8,8 @@ namespace fs { class FS; }
 // Связь «устройство → телефон → ИИ»:
 //   фото кладётся в очередь (ai_link_notify_photo из камеры),
 //   телефон забирает его по HTTP (GET /api/photo),
-//   присылает текстовый ответ (POST /api/answer),
-//   ответ показывается на экране устройства (экран «ИИ»).
+//   присылает чат-обмен (вопрос+ответ) через POST /api/chat,
+//   экран «ИИ» показывает переписку (GET /api/history — для телефона).
 typedef enum {
     AI_LINK_IDLE = 0,      // фото не снималось
     AI_LINK_PENDING = 1,   // фото ждёт, когда телефон его заберёт
@@ -17,11 +17,26 @@ typedef enum {
     AI_LINK_ANSWERED = 3,  // ответ получен
 } AiLinkState;
 
-void ai_link_init();                       // обработчики + LVGL-таймер автооткрытия
+// --- История чата (кольцо, сохраняется в LittleFS /ai_chat.log) ---
+#define AI_HIST_MAX 16
+#define AI_HIST_Q   256    // вопрос (в т.ч. прикреплённый промпт)
+#define AI_HIST_A   1024   // ответ ИИ
+
+typedef struct {
+    uint8_t type;          // 0 = событие фото, 1 = вопрос+ответ
+    char time[12];         // "12:34"
+    char q[AI_HIST_Q];     // вопрос пользователя (может быть пустым)
+    char a[AI_HIST_A];     // ответ ИИ (для type=0 пусто)
+} AiHistEntry;
+
+void ai_link_init();                       // история + обработчики + таймер
 void ai_link_ensure_server();              // запуск сервера, когда WiFi поднят
-void ai_link_notify_photo(fs::FS* f, const char* path);  // вызывается из save_photo
+void ai_link_notify_photo(fs::FS* f, const char* path);  // из save_photo
 
 AiLinkState ai_link_state();
 uint32_t ai_link_photo_id();
-uint32_t ai_link_answer_seq();             // № ответа (0 = ответов ещё не было)
-size_t ai_link_answer_copy(char* out, size_t max);       // копия текста ответа
+uint32_t ai_link_answer_seq();             // № ответа (для автооткрытия)
+
+uint32_t ai_link_history_seq();            // растёт на каждое событие чата
+int  ai_link_history_count();
+bool ai_link_history_get(int idx, AiHistEntry* out);  // копия одной записи

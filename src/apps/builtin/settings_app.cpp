@@ -23,6 +23,16 @@ static int current_storage = 0; // 0 = Flash, 1 = SD Card (loaded from NVS)
 static bool current_wifi = false;
 static const int ITEM_COUNT = 4;
 
+static lv_obj_t* row_for_item(int i) {
+    switch (i) {
+        case 0:  return row_brightness;
+        case 1:  return row_lang;
+        case 2:  return row_storage;
+        case 3:  return row_wifi;
+        default: return nullptr;
+    }
+}
+
 static void highlight_items() {
     if (row_brightness) {
         lv_obj_set_style_bg_opa(row_brightness,
@@ -42,6 +52,13 @@ static void highlight_items() {
     }
 }
 
+// Экран выше 240px (4 пункта) — прокрутить выбранный пункт на вид.
+// Вызывается только из навигации (при открытии layout ещё не посчитан).
+static void scroll_to_current() {
+    lv_obj_t* row = row_for_item(current_item);
+    if (row) lv_obj_scroll_to_view(row, LV_ANIM_ON);
+}
+
 void settings_app_button(int button_id, int event) {
     if (event != BTN_EVENT_CLICKED) return;
 
@@ -49,10 +66,12 @@ void settings_app_button(int button_id, int event) {
         current_item--;
         if (current_item < 0) current_item = ITEM_COUNT - 1;
         highlight_items();
+        scroll_to_current();
     } else if (button_id == BTN_ID_DOWN) {
         current_item++;
         if (current_item >= ITEM_COUNT) current_item = 0;
         highlight_items();
+        scroll_to_current();
     } else if (button_id == BTN_ID_RIGHT) {
         if (current_item == 0 && slider_brightness) {
             int val = lv_slider_get_value(slider_brightness);
@@ -278,6 +297,10 @@ void settings_app_open(lv_obj_t* parent) {
     lv_label_set_text(lbl_wifi_val, lang_str_settings_wifi_name(current_wifi));
     lv_obj_set_style_text_color(lbl_wifi_val, theme_color_accent(), 0);
     lv_obj_set_style_text_font(lbl_wifi_val, &lv_font_cyr_14, 0);
+
+    // Экран выше 240px — разрешить прокрутку контента вниз
+    lv_obj_remove_flag(parent, LV_OBJ_FLAG_SCROLL_ELASTIC);
+    lv_obj_set_scrollbar_mode(parent, LV_SCROLLBAR_MODE_AUTO);
 
     highlight_items();
 }

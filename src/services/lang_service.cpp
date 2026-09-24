@@ -9,6 +9,7 @@ struct LangStrings {
     const char* app_settings;
     const char* app_explorer;
     const char* app_ai;
+    const char* ai_you;
     const char* settings_title;
     const char* settings_wifi;
     const char* wifi_on;
@@ -43,6 +44,7 @@ static const LangStrings lang_en = {
     .app_settings    = "Settings",
     .app_explorer    = "Explorer",
     .app_ai          = "AI",
+    .ai_you          = "Me",
     .settings_title  = "Settings",
     .settings_wifi   = "WiFi network",
     .wifi_on         = "On",
@@ -77,6 +79,7 @@ static const LangStrings lang_ru = {
     .app_settings    = "Настройки",
     .app_explorer    = "Проводник",
     .app_ai          = "ИИ",
+    .ai_you          = "Вы",
     .settings_title  = "Настройки",
     .settings_wifi   = "WiFi сеть",
     .wifi_on         = "Вкл",
@@ -154,6 +157,7 @@ const char* lang_str_camera_mode_fill(){ return langs[current_lang]->camera_mode
 const char* lang_str_camera_mode_fit() { return langs[current_lang]->camera_mode_fit; }
 const char* lang_str_app_explorer()   { return langs[current_lang]->app_explorer; }
 const char* lang_str_app_ai()         { return langs[current_lang]->app_ai; }
+const char* lang_str_ai_you()         { return langs[current_lang]->ai_you; }
 const char* lang_str_settings_wifi()  { return langs[current_lang]->settings_wifi; }
 const char* lang_str_ai_nothing()     { return langs[current_lang]->ai_nothing; }
 const char* lang_str_ai_pending()     { return langs[current_lang]->ai_pending; }

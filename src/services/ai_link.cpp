@@ -6,14 +6,20 @@
 #include <Arduino.h>
 #include <WebServer.h>
 #include <FS.h>
+#include <LittleFS.h>
+#include <freertos/semphr.h>
 #include <cstring>
 #include <cstdio>
+#include <ctime>
 
-// Все общие данные (фото в очереди + текст ответа) защищены одним мьютексом:
-// пишутся из LVGL-потока (сохранение фото) и из HTTP-задачи (ответ телефона).
+// Данные общие: пишутся из LVGL-потока (событие фото) и HTTP-задачи
+// (обмен от телефона), читаются из LVGL (экран «ИИ»).
+// lk_mux — критическая секция; hist_file_sem — сериализация записи файла.
 #define ANSWER_MAX 4096
+#define HIST_FILE  "/ai_chat.log"
 
 static portMUX_TYPE lk_mux = portMUX_INITIALIZER_UNLOCKED;
+static SemaphoreHandle_t hist_file_sem = nullptr;
 
 static WebServer server(80);
 
@@ -27,10 +33,20 @@ static char       answer_buf[ANSWER_MAX];
 static size_t     answer_len = 0;
 static uint32_t   answer_seq = 0;
 
-static volatile bool ai_ready = false;        // обработчики зарегистрированы
-static volatile bool server_started = false;  // server.begin() вызван
+// Кольцо истории: без memmove, head — слот следующей записи
+static AiHistEntry hist[AI_HIST_MAX];
+static int         hist_head = 0;
+static int         hist_cnt = 0;
+static uint32_t    hist_seq = 0;
 
-// --- Геттеры (LVGL-поток) ---
+// Буферы под запись файла (защищены hist_file_sem)
+static AiHistEntry pers_tmp;
+static char        pers_line[AI_HIST_Q + AI_HIST_A + 64];
+
+static volatile bool ai_ready = false;
+static volatile bool server_started = false;
+
+// ---------- Геттеры ----------
 
 AiLinkState ai_link_state() {
     portENTER_CRITICAL(&lk_mux);
@@ -50,15 +66,199 @@ uint32_t ai_link_answer_seq() {
     return answer_seq;  // uint32 — атомарное чтение на Xtensa
 }
 
-size_t ai_link_answer_copy(char* out, size_t max) {
-    if (!out || max == 0) return 0;
+uint32_t ai_link_history_seq() {
+    return hist_seq;
+}
+
+int ai_link_history_count() {
     portENTER_CRITICAL(&lk_mux);
-    size_t n = answer_len < max - 1 ? answer_len : max - 1;
-    memcpy(out, answer_buf, n);
-    out[n] = '\0';
+    int n = hist_cnt;
     portEXIT_CRITICAL(&lk_mux);
     return n;
 }
+
+bool ai_link_history_get(int idx, AiHistEntry* out) {
+    if (!out || idx < 0) return false;
+    bool ok = false;
+    portENTER_CRITICAL(&lk_mux);
+    if (idx < hist_cnt) {
+        int phys = (hist_head - hist_cnt + idx + AI_HIST_MAX * 2) % AI_HIST_MAX;
+        *out = hist[phys];
+        ok = true;
+    }
+    portEXIT_CRITICAL(&lk_mux);
+    return ok;
+}
+
+// ---------- История: кодирование строк файла ----------
+
+// '\n' → "\\n", '\\' → "\\\", '\t'/0x1F → ' ', '\r' убрать
+static void esc_write(char* dst, size_t max, size_t* pos, const char* src) {
+    for (size_t i = 0; src[i] && *pos < max - 1; i++) {
+        char c = src[i];
+        if (c == '\r') continue;
+        if (c == '\n' || c == '\\') {
+            if (*pos >= max - 2) break;
+            dst[(*pos)++] = '\\';
+            dst[(*pos)++] = (c == '\n') ? 'n' : '\\';
+        } else if (c == '\t' || c == '\x1f') {
+            dst[(*pos)++] = ' ';
+        } else {
+            dst[(*pos)++] = c;
+        }
+    }
+    dst[*pos] = '\0';
+}
+
+static void esc_read(const char* src, char* dst, size_t max) {
+    size_t o = 0;
+    for (size_t i = 0; src[i] && o < max - 1; i++) {
+        char c = src[i];
+        if (c == '\\' && src[i + 1]) {
+            i++;
+            c = (src[i] == 'n') ? '\n' : src[i];  // \n и \\, прочее — как есть
+        }
+        dst[o++] = c;
+    }
+    dst[o] = '\0';
+}
+
+// Обрезать ровно по границе UTF-8 (не рвать символ посередине)
+static void utf8_cut(char* s, size_t max) {
+    if (strlen(s) < max) return;
+    s[max - 1] = '\0';
+    size_t n = strlen(s);
+    while (n > 0 && ((unsigned char)s[n] & 0xC0) == 0x80) n--;
+    s[n] = '\0';
+}
+
+static void now_hm(char* out, size_t max) {
+    time_t t = time(nullptr);
+    struct tm* lt = localtime(&t);
+    snprintf(out, max, "%02d:%02d", lt->tm_hour, lt->tm_min);
+}
+
+// Файл: строки вида "T\x1fHH:MM\x1fq\x1fa\n" (экранировано)
+static void persist_append(int phys) {
+    if (!hist_file_sem) return;
+    xSemaphoreTake(hist_file_sem, portMAX_DELAY);
+    portENTER_CRITICAL(&lk_mux);
+    pers_tmp = hist[phys];
+    portEXIT_CRITICAL(&lk_mux);
+
+    size_t pos = 0;
+    pers_line[pos++] = (char)('0' + pers_tmp.type);
+    pers_line[pos++] = '\x1f';
+    esc_write(pers_line, sizeof(pers_line), &pos, pers_tmp.time);
+    pers_line[pos++] = '\x1f';
+    esc_write(pers_line, sizeof(pers_line), &pos, pers_tmp.q);
+    pers_line[pos++] = '\x1f';
+    esc_write(pers_line, sizeof(pers_line), &pos, pers_tmp.a);
+    pers_line[pos++] = '\n';
+    pers_line[pos] = '\0';
+
+    File f = LittleFS.open(HIST_FILE, FILE_APPEND);
+    if (f) {
+        f.print(pers_line);
+        f.close();
+    }
+    xSemaphoreGive(hist_file_sem);
+}
+
+// Добавить событие в чат (type: 0=фото, 1=вопрос+ответ)
+static void hist_add(uint8_t type, const char* q, const char* a) {
+    portENTER_CRITICAL(&lk_mux);
+    AiHistEntry& e = hist[hist_head];
+    memset(&e, 0, sizeof(e));
+    e.type = type;
+    now_hm(e.time, sizeof(e.time));
+    strncpy(e.q, q ? q : "", AI_HIST_Q - 1);
+    strncpy(e.a, a ? a : "", AI_HIST_A - 1);
+    utf8_cut(e.q, AI_HIST_Q);
+    utf8_cut(e.a, AI_HIST_A);
+    hist_head = (hist_head + 1) % AI_HIST_MAX;
+    if (hist_cnt < AI_HIST_MAX) hist_cnt++;
+    hist_seq++;
+    if (type == 1) {           // ответ — триггер автооткрытия экрана
+        answer_seq++;
+        state = AI_LINK_ANSWERED;
+    }
+    int phys = (hist_head - 1 + AI_HIST_MAX) % AI_HIST_MAX;
+    portEXIT_CRITICAL(&lk_mux);
+
+    persist_append(phys);
+}
+
+// Загрузка истории из файла + компактизация (файл ≤ AI_HIST_MAX строк)
+static void hist_load() {
+    if (!LittleFS.exists(HIST_FILE)) return;
+    File f = LittleFS.open(HIST_FILE, FILE_READ);
+    if (!f) return;
+    size_t sz = f.size();
+    if (sz > 65536) {          // защита от мусорного файла
+        f.close();
+        LittleFS.remove(HIST_FILE);
+        return;
+    }
+    char* buf = (char*)malloc(sz + 1);
+    if (!buf) { f.close(); return; }
+    f.read((uint8_t*)buf, sz);
+    buf[sz] = '\0';
+    f.close();
+
+    char* line = strtok(buf, "\n");
+    while (line) {
+        // Формат: "T\x1fHH:MM\x1fq\x1fa" — разделители после типа,
+        // времени и вопроса; ответ идёт до конца строки.
+        if (strlen(line) > 4 && line[1] == '\x1f') {
+            uint8_t type = (uint8_t)(line[0] - '0');
+            char* f1 = strchr(line + 2, '\x1f');               // конец time
+            char* f2 = f1 ? strchr(f1 + 1, '\x1f') : nullptr;  // конец q
+            if (type <= 1 && f1 && f2) {
+                *f1 = '\0';
+                *f2 = '\0';
+                AiHistEntry& e = hist[hist_head];
+                memset(&e, 0, sizeof(e));
+                e.type = type;
+                strncpy(e.time, line + 2, sizeof(e.time) - 1);
+                esc_read(f1 + 1, e.q, AI_HIST_Q);
+                esc_read(f2 + 1, e.a, AI_HIST_A);
+                hist_head = (hist_head + 1) % AI_HIST_MAX;
+                if (hist_cnt < AI_HIST_MAX) hist_cnt++;
+            }
+        }
+        line = strtok(nullptr, "\n");
+    }
+    free(buf);
+
+    // Компактизация: переписать файл только актуальными строками
+    if (hist_file_sem && xSemaphoreTake(hist_file_sem, portMAX_DELAY) == pdTRUE) {
+        File w = LittleFS.open(HIST_FILE, FILE_WRITE);
+        if (w) {
+            for (int i = 0; i < hist_cnt; i++) {
+                int phys = (hist_head - hist_cnt + i + AI_HIST_MAX * 2) % AI_HIST_MAX;
+                const AiHistEntry& e = hist[phys];
+                size_t pos = 0;
+                pers_line[pos++] = (char)('0' + e.type);
+                pers_line[pos++] = '\x1f';
+                esc_write(pers_line, sizeof(pers_line), &pos, e.time);
+                pers_line[pos++] = '\x1f';
+                esc_write(pers_line, sizeof(pers_line), &pos, e.q);
+                pers_line[pos++] = '\x1f';
+                esc_write(pers_line, sizeof(pers_line), &pos, e.a);
+                pers_line[pos++] = '\n';
+                pers_line[pos] = '\0';
+                w.print(pers_line);
+            }
+            w.close();
+        }
+        xSemaphoreGive(hist_file_sem);
+    }
+    if (hist_cnt) hist_seq = 1;  // есть прошлая переписка (не открывать экран)
+    Serial.printf("ai_link: history loaded (%d entries)\n", hist_cnt);
+}
+
+// ---------- Очередь фото ----------
 
 void ai_link_notify_photo(fs::FS* f, const char* path) {
     if (!f || !path) return;
@@ -75,15 +275,55 @@ void ai_link_notify_photo(fs::FS* f, const char* path) {
     state = AI_LINK_PENDING;
     portEXIT_CRITICAL(&lk_mux);
 
+    hist_add(0, "", "");   // событие в чат: «фото сохранено»
     Serial.printf("ai_link: photo #%u queued (%s)\n",
                   (unsigned)photo_id, photo_path);
 }
 
-// --- HTTP-обработчики (выполняются в HTTP-задаче) ---
+// ---------- Разбор ----------
+
+static void url_decode(const char* in, char* out, size_t max) {
+    size_t o = 0;
+    auto hex = [](char h) -> int {
+        if (h >= '0' && h <= '9') return h - '0';
+        if (h >= 'a' && h <= 'f') return h - 'a' + 10;
+        if (h >= 'A' && h <= 'F') return h - 'A' + 10;
+        return -1;
+    };
+    for (size_t i = 0; in[i] && o < max - 1; i++) {
+        char c = in[i];
+        if (c == '+') {
+            c = ' ';
+        } else if (c == '%' && in[i + 1] && in[i + 2]) {
+            int hi = hex(in[i + 1]), lo = hex(in[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                c = (char)(hi * 16 + lo);
+                i += 2;
+            }
+        }
+        out[o++] = c;
+    }
+    out[o] = '\0';
+}
+
+static void json_escape_write(String& out, const char* s) {
+    for (size_t i = 0; s[i]; i++) {
+        char c = s[i];
+        if (c == '"')       out += F("\\\"");
+        else if (c == '\\') out += F("\\\\");
+        else if (c == '\n') out += F("\\n");
+        else if (c == '\r') out += F("\\r");
+        else if (c == '\t') out += F("\\t");
+        else if ((unsigned char)c < 0x20) { /* пропускаем управляющие */ }
+        else out += c;
+    }
+}
+
+// ---------- HTTP-обработчики (HTTP-задача) ----------
 
 static void h_state() {
     char name[32];
-    char buf[256];
+    char buf[288];
     portENTER_CRITICAL(&lk_mux);
     strncpy(name, photo_name, sizeof(name) - 1);
     name[sizeof(name) - 1] = '\0';
@@ -93,9 +333,10 @@ static void h_state() {
     portEXIT_CRITICAL(&lk_mux);
 
     snprintf(buf, sizeof(buf),
-             "{\"state\":%d,\"id\":%u,\"name\":\"%s\",\"seq\":%u,\"alen\":%u}",
+             "{\"state\":%d,\"id\":%u,\"name\":\"%s\",\"seq\":%u,\"alen\":%u,\"hseq\":%u,\"hcnt\":%d}",
              (int)st, (unsigned)id, name,
-             (unsigned)answer_seq, (unsigned)alen);
+             (unsigned)answer_seq, (unsigned)alen,
+             (unsigned)hist_seq, hist_cnt);
     server.send(200, "application/json", buf);
 }
 
@@ -126,8 +367,10 @@ static void h_photo() {
     Serial.printf("ai_link: photo #%s sent to phone\n", p);
 }
 
-static void h_answer() {
+// Общий обработчик ответа: вопрос (опц., URL-encoded в заголовке) + текст
+static void handle_chat_reply() {
     String id_h = server.header("X-Id");
+    String q_h = server.header("X-Question");
     String body = server.arg("plain");
     if (body.length() == 0) {
         server.send(400, "text/plain", "empty body");
@@ -136,25 +379,57 @@ static void h_answer() {
     if ((size_t)body.length() >= ANSWER_MAX)
         body = body.substring(0, ANSWER_MAX - 1);
 
+    char qdec[AI_HIST_Q];
+    url_decode(q_h.c_str(), qdec, sizeof(qdec));
+
     portENTER_CRITICAL(&lk_mux);
     memcpy(answer_buf, body.c_str(), body.length());
     answer_len = body.length();
-    answer_seq++;
-    state = AI_LINK_ANSWERED;
     portEXIT_CRITICAL(&lk_mux);
 
-    Serial.printf("ai_link: answer #%u received (%u bytes, for X-Id=%s)\n",
-                  (unsigned)answer_seq, (unsigned)body.length(),
-                  id_h.c_str());
+    hist_add(1, qdec, body.c_str());
+
+    Serial.printf("ai_link: chat reply #%u (X-Id=%s, q=%u chars, a=%u chars)\n",
+                  (unsigned)answer_seq, id_h.c_str(),
+                  (unsigned)strlen(qdec), (unsigned)body.length());
     server.send(200, "text/plain", "ok");
 }
 
-// Страница для отладки из браузера телефона — путь без приложения.
+// POST /api/chat — вопрос+ответ (новый контракт приложения)
+static void h_chat() { handle_chat_reply(); }
+
+// POST /api/answer — только ответ (обратная совместимость)
+static void h_answer() { handle_chat_reply(); }
+
+// GET /api/history — вся переписка для телефона
+static void h_history() {
+    String out;
+    out.reserve(2048 + hist_cnt * (AI_HIST_Q + AI_HIST_A));
+    out += '[';
+    for (int i = 0; i < hist_cnt; i++) {
+        AiHistEntry e;
+        if (!ai_link_history_get(i, &e)) continue;
+        if (i) out += ',';
+        out += F("{\"t\":");
+        out += (int)e.type;
+        out += F(",\"time\":\"");
+        out += e.time;
+        out += F("\",\"q\":\"");
+        json_escape_write(out, e.q);
+        out += F("\",\"a\":\"");
+        json_escape_write(out, e.a);
+        out += F("\"}");
+    }
+    out += ']';
+    server.send(200, "application/json", out);
+}
+
+// Страница для отладки из браузера телефона
 static void h_root() {
     char name[32];
     char ans[ANSWER_MAX];
     AiLinkState st;
-    uint32_t id, seq;
+    uint32_t id;
     size_t alen;
 
     portENTER_CRITICAL(&lk_mux);
@@ -166,7 +441,6 @@ static void h_root() {
     memcpy(ans, answer_buf, answer_len);
     ans[answer_len] = '\0';
     portEXIT_CRITICAL(&lk_mux);
-    seq = answer_seq;
 
     String html;
     html.reserve(1024 + alen);
@@ -188,11 +462,9 @@ static void h_root() {
     html += F("</p>");
     if (st == AI_LINK_PENDING || st == AI_LINK_TAKEN)
         html += F("<p><a href='/api/photo'>&#8595; скачать фото</a></p>");
+    html += F("<p><a href='/api/history'>переписка (JSON)</a></p>");
     if (alen) {
-        html += F("<p>Ответ ИИ (#");
-        html += String(seq);
-        html += F("):</p><pre>");
-        // экранирование HTML
+        html += F("<p>Последний ответ:</p><pre>");
         for (size_t i = 0; i < alen; i++) {
             char c = ans[i];
             if (c == '&') html += F("&amp;");
@@ -206,41 +478,36 @@ static void h_root() {
     server.send(200, "text/html", html);
 }
 
-// --- LVGL-таймер: автооткрытие экрана «ИИ» при новом ответе ---
-// Ответ приходит из HTTP-задачи; переключать экраны можно только
-// из потока LVGL, поэтому — через таймер.
+// ---------- LVGL-таймер: автооткрытия экрана «ИИ» ----------
 
 static void poll_cb(lv_timer_t*) {
     uint32_t seq = answer_seq;
-    if (seq == 0) return;                       // ответов ещё не было
+    if (seq == 0) return;
     static uint32_t seen_seq = 0;
-    if (seq == seen_seq) return;                // уже показали
+    if (seq == seen_seq) return;
 
-    if (ui_manager_current() == SCREEN_SPLASH) return;  // ждём загрузки
+    if (ui_manager_current() == SCREEN_SPLASH) return;
 
     int ai_idx = app_host_ai_index();
     if (ai_idx < 0) return;
 
     if (app_host_in_app() && app_host_current() == ai_idx) {
-        seen_seq = seq;   // экран уже открыт — обновит его собственный таймер
+        seen_seq = seq;
         return;
     }
     seen_seq = seq;
     app_host_open_index(ai_idx);
 }
 
+// ---------- Сервер ----------
+
 static void http_task_fn(void*) {
     for (;;) {
-        // handleClient() безопасен только после begin(): до этого
-        // lwIP может быть вообще не инициализирован (WiFi выключен)
         if (server_started) server.handleClient();
         vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
 
-// Вызывается из ai_link_init и из wifi_service_start (когда AP поднят).
-// server.begin() создаёт lwIP-сокет — без инициализированного стека
-// это assert «Invalid mbox» и boot-loop с чёрным экраном.
 void ai_link_ensure_server() {
     if (server_started || !ai_ready) return;
     if (!wifi_service_running()) {
@@ -253,16 +520,22 @@ void ai_link_ensure_server() {
 }
 
 void ai_link_init() {
-    const char* hdr_keys[] = {"X-Id"};
-    server.collectHeaders(hdr_keys, 1);
+    hist_file_sem = xSemaphoreCreateMutex();
+
+    hist_load();   // до обработчиков: файл читаем один раз при загрузке
+
+    const char* hdr_keys[] = {"X-Id", "X-Question"};
+    server.collectHeaders(hdr_keys, 2);
     server.on("/", HTTP_GET, h_root);
     server.on("/api/state", HTTP_GET, h_state);
     server.on("/api/photo", HTTP_GET, h_photo);
+    server.on("/api/chat", HTTP_POST, h_chat);
     server.on("/api/answer", HTTP_POST, h_answer);
+    server.on("/api/history", HTTP_GET, h_history);
     ai_ready = true;
 
     xTaskCreatePinnedToCore(http_task_fn, "ai_http", 8192, nullptr, 1, nullptr, 1);
 
     lv_timer_create(poll_cb, 300, nullptr);
-    ai_link_ensure_server();   // если WiFi уже поднят — начинаем сразу
+    ai_link_ensure_server();
 }
