@@ -7,6 +7,7 @@
 #include <WebServer.h>
 #include <FS.h>
 #include <LittleFS.h>
+#include <SD_MMC.h>
 #include <freertos/semphr.h>
 #include <cstring>
 #include <cstdio>
@@ -491,6 +492,148 @@ static void h_history() {
     server.send(200, "application/json", out);
 }
 
+// ---------- Файловый API (телефон: список/скачать/загрузить/удалить) ----------
+// Виртуальные пути: "/flash/..." → LittleFS, "/sd/..." → SD (/sdcard).
+// "/" — корень с двумя папками (sd — только если карта вставлена).
+
+static fs::FS* fs_resolve(const String& vpath, String& real) {
+    real = "";
+    if (vpath == "/flash" || vpath.startsWith("/flash/")) {
+        real = "/";
+        real += vpath.substring(6);          // "/flash/images" → "/images"
+        if (vpath.indexOf("..") >= 0) return nullptr;
+        return &LittleFS;
+    }
+    if (vpath == "/sd" || vpath.startsWith("/sd/")) {
+        real = "/sdcard";
+        if (vpath.length() > 3) real += vpath.substring(3);  // "/sd/DCIM" → "/sdcard/DCIM"
+        if (vpath.indexOf("..") >= 0) return nullptr;
+        return &SD_MMC;
+    }
+    return nullptr;
+}
+
+// GET /api/fs?path=/flash/images — список каталога
+static void h_fs() {
+    String vp = server.arg("path");
+    if (!vp.length()) vp = "/";
+
+    if (vp == "/") {
+        String out = F("[{\"n\":\"flash\",\"d\":1}");
+        if (SD_MMC.cardType() != CARD_NONE) out += F(",{\"n\":\"sd\",\"d\":1}");
+        out += ']';
+        server.send(200, "application/json", out);
+        return;
+    }
+
+    String real;
+    fs::FS* fsp = fs_resolve(vp, real);
+    if (!fsp) { server.send(400, "application/json", "{\"err\":\"bad path\"}"); return; }
+
+    File dir = fsp->open(real, FILE_READ);
+    if (!dir || !dir.isDirectory()) {
+        if (dir) dir.close();
+        server.send(404, "application/json", "{\"err\":\"not found\"}");
+        return;
+    }
+
+    String out;
+    out.reserve(2048);
+    out += '[';
+    bool first = true;
+    File e;
+    while ((e = dir.openNextFile())) {
+        String n = e.name();
+        int sl = n.lastIndexOf('/');
+        if (sl >= 0) n = n.substring(sl + 1);
+        if (n.length()) {
+            if (!first) out += ',';
+            first = false;
+            out += F("{\"n\":\"");
+            json_escape_write(out, n.c_str());
+            out += F("\",\"s\":");
+            out += (unsigned long)e.size();
+            out += F(",\"d\":");
+            out += e.isDirectory() ? 1 : 0;
+            out += '}';
+        }
+        e.close();
+    }
+    out += ']';
+    dir.close();
+    server.send(200, "application/json", out);
+}
+
+// GET /api/file?path=/flash/img.jpg — скачать файл
+static void h_file_get() {
+    String vp = server.arg("path");
+    String real;
+    fs::FS* fsp = fs_resolve(vp, real);
+    if (!fsp) { server.send(400, "text/plain", "bad path"); return; }
+    File f = fsp->open(real, FILE_READ);
+    if (!f || f.isDirectory()) {
+        if (f) f.close();
+        server.send(404, "text/plain", "not found");
+        return;
+    }
+    server.streamFile(f, "application/octet-stream");
+    f.close();
+}
+
+// POST /api/file?path=/flash/new.bin — загрузить (потоково, по 2-4 КБ)
+static fs::FS* up_fs = nullptr;
+static String   up_real;
+static File     up_file;
+static bool     up_err = false;
+
+static void h_file_upload() {
+    HTTPUpload& u = server.upload();
+    if (u.status == UPLOAD_FILE_START) {
+        up_err = false;
+        up_file = File();
+        up_real = "";
+        String vp = server.arg("path");
+        up_fs = vp.length() ? fs_resolve(vp, up_real) : nullptr;
+        if (!up_fs || up_real == "/" || up_real == "/sdcard") { up_err = true; return; }
+        if (up_fs->exists(up_real)) up_fs->remove(up_real);
+        up_file = up_fs->open(up_real, FILE_WRITE);
+        if (!up_file || up_file.isDirectory()) { up_file = File(); up_err = true; }
+    } else if (u.status == UPLOAD_FILE_WRITE) {
+        if (up_err || !up_file) return;
+        if (up_file.write(u.buf, u.currentSize) != u.currentSize) up_err = true;
+    } else if (u.status == UPLOAD_FILE_END) {
+        if (up_file) up_file.close();
+    }
+}
+
+static void h_file_post() {
+    if (up_err && up_fs && up_real.length() && up_fs->exists(up_real))
+        up_fs->remove(up_real);          // недописанный файл не оставляем
+    up_fs = nullptr;
+    if (up_err) { server.send(500, "application/json", "{\"err\":\"write failed\"}"); return; }
+    server.send(200, "application/json", "{\"ok\":1}");
+}
+
+// DELETE /api/file?path=/flash/img.jpg — удалить файл или пустую папку
+static void h_file_del() {
+    String vp = server.arg("path");
+    String real;
+    fs::FS* fsp = fs_resolve(vp, real);
+    if (!fsp || real == "/" || real == "/sdcard") {
+        server.send(400, "application/json", "{\"err\":\"bad path\"}");
+        return;
+    }
+    if (!fsp->exists(real)) {
+        server.send(404, "application/json", "{\"err\":\"not found\"}");
+        return;
+    }
+    if (!fsp->remove(real)) {
+        server.send(500, "application/json", "{\"err\":\"remove failed\"}");
+        return;
+    }
+    server.send(200, "application/json", "{\"ok\":1}");
+}
+
 // Страница для отладки из браузера телефона
 static void h_root() {
     char name[32];
@@ -600,6 +743,10 @@ void ai_link_init() {
     server.on("/api/chat", HTTP_POST, h_chat);
     server.on("/api/answer", HTTP_POST, h_answer);
     server.on("/api/history", HTTP_GET, h_history);
+    server.on("/api/fs", HTTP_GET, h_fs);
+    server.on("/api/file", HTTP_GET, h_file_get);
+    server.on("/api/file", HTTP_POST, h_file_post, h_file_upload);
+    server.on("/api/file", HTTP_DELETE, h_file_del);
     ai_ready = true;
 
     xTaskCreatePinnedToCore(http_task_fn, "ai_http", 8192, nullptr, 1, nullptr, 1);

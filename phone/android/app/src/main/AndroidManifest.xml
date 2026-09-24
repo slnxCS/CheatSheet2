@@ -21,5 +21,9 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <!-- 📁 файловый менеджер: флэш/SD устройства -->
+        <activity
+            android:name=".FileActivity"
+            android:exported="false" />
     </application>
 </manifest>

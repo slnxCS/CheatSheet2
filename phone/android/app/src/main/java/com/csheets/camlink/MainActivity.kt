@@ -2,6 +2,7 @@ package com.csheets.camlink
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
@@ -10,11 +11,15 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Bundle
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.provider.OpenableColumns
 import android.provider.Settings
+import android.provider.MediaStore
 import android.text.InputType
 import android.util.Base64
 import android.util.TypedValue
@@ -25,6 +30,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.ArrayAdapter
+import android.widget.ListView
 import android.widget.TextView
 import org.json.JSONArray
 import org.json.JSONObject
@@ -35,6 +41,66 @@ import java.net.URL
 import java.net.URLEncoder
 import java.util.concurrent.Executors
 import kotlin.concurrent.thread
+
+// ---------- Общая связь с устройством (общи для MainActivity и FileActivity) ----------
+
+private const val ESP_IP = "192.168.4.1"
+
+// Handle сети ESP от WifiNetworkSpecifier — живёт, пока открыто приложение
+@Volatile private var espNetwork: Network? = null
+
+// Момент последнего УСПЕШНОГО запроса — «линк работал» (для шторм-капа EPERM)
+@Volatile private var lastReqOkAt = 0L
+
+// MainActivity подключает сюда сброс (invalidateEsp) при смерти линка
+private var espDeadHandler: ((String) -> Unit)? = null
+
+// HTTP к устройству: сокет принудительно привязан к сети ESP, иначе трафик
+// уйдёт в мобильный интернет и 192.168.4.1 будет недоступен.
+private fun espRequest(path: String, method: String = "GET",
+                       headers: Map<String, String>? = null,
+                       body: ByteArray? = null): Pair<Int, ByteArray> {
+    val net = espNetwork ?: throw IOException("нет связи с устройством")
+    val url = URL("http://$ESP_IP$path")
+    try {
+        // Network.openConnection — трафик идёт только по сети ESP
+        val conn = net.openConnection(url) as HttpURLConnection
+        conn.apply {
+            connectTimeout = 5_000
+            readTimeout = if (path.startsWith("/api/photo") || path.startsWith("/api/file"))
+                30_000 else 8_000
+            requestMethod = method
+            headers?.forEach { (k, v) -> setRequestProperty(k, v) }
+            if (body != null) {
+                doOutput = true
+                outputStream.use { it.write(body) }
+            }
+        }
+        val code = conn.responseCode
+        val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+        val data = stream?.use { inp ->
+            val out = ByteArrayOutputStream()
+            val buf = ByteArray(16 * 1024)
+            while (true) {
+                val n = inp.read(buf)
+                if (n < 0) break
+                out.write(buf, 0, n)
+            }
+            out.toByteArray()
+        } ?: ByteArray(0)
+        conn.disconnect()
+        lastReqOkAt = System.currentTimeMillis()
+        return code to data
+    } catch (e: IOException) {
+        val m = e.message.orEmpty()
+        if (m.contains("Binding socket") || m.contains("EPERM") ||
+            m.contains("ENONET") || m.contains("unreachable")) {
+            espDeadHandler?.invoke(e.message ?: "сеть недействительна")
+            throw IOException("сеть устройства пропала — переподключаюсь…")
+        }
+        throw e
+    }
+}
 
 /*
  * CamLink — посредник «телефон ⇄ устройство CheatSheet2 ⇄ ИИ».
@@ -51,7 +117,6 @@ import kotlin.concurrent.thread
 class MainActivity : Activity() {
 
     private companion object {
-        const val ESP_IP = "192.168.4.1"
         const val ANSWER_MAX = 3800           // буфер ответа на устройстве — 4096
         const val DEFAULT_PROMPT =
             "Ты помогаешь на контрольной. Распознай вопрос на фото и дай краткий " +
@@ -68,7 +133,6 @@ class MainActivity : Activity() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val exec = Executors.newSingleThreadExecutor()
 
-    @Volatile private var espNetwork: Network? = null
     private var netCallback: ConnectivityManager.NetworkCallback? = null
     @Volatile private var pendingPhoto: ByteArray? = null
     private var lastSendSeen = 0L        // последний seen send с устройства
@@ -95,6 +159,7 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        espDeadHandler = { invalidateEsp(it) }
         buildUi()
         connectEsp()
         mainHandler.postDelayed(pollRunnable, 2000)
@@ -104,6 +169,7 @@ class MainActivity : Activity() {
         mainHandler.removeCallbacks(pollRunnable)
         netCallback?.let { cm.unregisterNetworkCallback(it) }
         netCallback = null
+        espDeadHandler = null
         exec.shutdownNow()
         super.onDestroy()
     }
@@ -173,6 +239,13 @@ class MainActivity : Activity() {
         }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT,
             LinearLayout.LayoutParams.WRAP_CONTENT, 0f))
         actionRow.addView(Button(this).apply {
+            text = "📁"
+            setOnClickListener {
+                startActivity(Intent(this@MainActivity, FileActivity::class.java))
+            }
+        }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT, 0f))
+        actionRow.addView(Button(this).apply {
             text = "↻"
             setOnClickListener { reconnectEsp() }
         }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT,
@@ -224,6 +297,8 @@ class MainActivity : Activity() {
         val ssid = prefs.getString("ssid", "CSCAM")!!
         val pass = prefs.getString("pass", "cscam1234")!!
         log("Запрос подключения к «$ssid» (системный диалог — «Подключиться»)…")
+        if (vpnActive())
+            log("! Активен VPN — он может запрещать привязку сокета к устройству (EPERM)")
 
         val specifier = try {
             android.net.wifi.WifiNetworkSpecifier.Builder()
@@ -332,63 +407,42 @@ class MainActivity : Activity() {
             log("  └ $since; $lost")
             espNetwork = null
             btnQuick.isEnabled = false
-            status("Переподключение к устройству…")
 
-            // 3+ обрыва в минуту = устройство не выдерживает нагрузки
-            // и перезагружается (просадка питания) — подсказать прямо
+            // VPN — известная системная причина EPERM: запрещает привязку
+            // сокета к локальной сети. Переподключение тут не поможет —
+            // не крутим шторм.
+            if (vpnActive()) {
+                log("! На телефоне активен VPN — он блокирует связь с устройством (EPERM).")
+                log("  Отключите VPN или добавьте CamLink в его исключения/обход.")
+                status("EPERM — мешает VPN (см. лог)")
+                return@post
+            }
+
+            // Шторм-кап: линк НЕ работал 2 минуты и 4 ошибки подряд —
+            // авто-переподключение не лечит причину, остановиться.
             val now = System.currentTimeMillis()
-            if (now - bindFailsWin > 60_000) { bindFailsWin = now; bindFails = 0 }
-            if (++bindFails == 3)
-                log("! Частые обрывы — похоже, устройство перезагружается " +
-                    "под нагрузкой. Проверьте питание: 5.0V под нагрузкой, " +
-                    "≥2A, конденсатор 470–1000µF.")
+            if (now - lastReqOkAt < 60_000) bindFails = 0      // линк работал недавно = реальные обрывы
+            if (now - bindFailsWin > 120_000) { bindFailsWin = now; bindFails = 0 }
+            bindFails++
+            if (bindFails >= 4) {
+                log("! Авто-переподключение остановлено ($bindFails подряд за 2 мин).")
+                log("  Причина на стороне телефона/линка — переподключение не лечит.")
+                log("  Нажмите ↻ после устранения причины.")
+                status("Переподключение остановлено — нажмите ↻")
+                return@post
+            }
+            if (bindFails == 3)
+                log("! Частые обрывы — если устройство не перезагружается, " +
+                    "проверьте питание: 5.0V под нагрузкой, ≥2A, " +
+                    "конденсатор 470–1000µF.")
+            status("Переподключение к устройству…")
+            scheduleAutoReconnect()
         }
-        scheduleAutoReconnect()
     }
 
-    // ---------- HTTP к устройству (сокет привязан к сети ESP) ----------
-
-    private fun espRequest(path: String, method: String = "GET",
-                           headers: Map<String, String>? = null,
-                           body: ByteArray? = null): Pair<Int, ByteArray> {
-        val net = espNetwork ?: throw IOException("нет связи с устройством")
-        val url = URL("http://$ESP_IP$path")
-        try {
-            // Network.openConnection — трафик идёт только по сети ESP
-            val conn = net.openConnection(url) as HttpURLConnection
-            conn.apply {
-                connectTimeout = 5_000
-                readTimeout = if (path == "/api/photo") 20_000 else 8_000
-                requestMethod = method
-                headers?.forEach { (k, v) -> setRequestProperty(k, v) }
-                if (body != null) {
-                    doOutput = true
-                    outputStream.use { it.write(body) }
-                }
-            }
-            val code = conn.responseCode
-            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-            val data = stream?.use { inp ->
-                val out = ByteArrayOutputStream()
-                val buf = ByteArray(16 * 1024)
-                while (true) {
-                    val n = inp.read(buf)
-                    if (n < 0) break
-                    out.write(buf, 0, n)
-                }
-                out.toByteArray()
-            } ?: ByteArray(0)
-            conn.disconnect()
-            return code to data
-        } catch (e: IOException) {
-            val m = e.message.orEmpty()
-            if (m.contains("Binding socket") || m.contains("EPERM") ||
-                m.contains("ENONET") || m.contains("unreachable")) {
-                invalidateEsp(e.message ?: "сеть недействительна")
-                throw IOException("сеть устройства пропала — переподключаюсь…")
-            }
-            throw e
-        }
+    private fun vpnActive(): Boolean {
+        val caps = cm.activeNetwork?.let { cm.getNetworkCapabilities(it) }
+        return caps?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
     }
 
     // ---------- Отправка ----------
@@ -399,7 +453,7 @@ class MainActivity : Activity() {
         val photo = pendingPhoto
         if (text.isEmpty() && photo == null) return
         etInput.setText("")
-        if (text.isNotEmpty()) log("→ $text")
+        if (text.isNotEmpty()) log("вопрос: ${text.length} симв → устройство")
 
         btnSend.isEnabled = false
         val headers = mutableMapOf("X-Id" to "chat")
@@ -424,7 +478,7 @@ class MainActivity : Activity() {
             try {
                 status("ИИ думает…")
                 val answer = callAi(photo, text).trim()
-                log("← $answer")
+                log("ответ ИИ: ${answer.length} симв")
                 pendingPhoto = null
 
                 // ответ (с дублем вопроса — если шаг 1 не прошл, он станет новым обменом)
@@ -485,11 +539,11 @@ class MainActivity : Activity() {
         log("Фото: ${photo.size / 1024} КБ")
 
         val question = detectPendingQuestion()
-        if (question.isNotEmpty()) log("→ $question")
+        if (question.isNotEmpty()) log("вопрос с устройства: ${question.length} симв")
 
         status("ИИ думает…")
         val answer = callAi(photo, question).trim()
-        log("← $answer")
+        log("ответ ИИ: ${answer.length} симв")
 
         val headers = mutableMapOf(
             "X-Id" to "auto",
@@ -800,6 +854,270 @@ class MainActivity : Activity() {
                     .putString("pass", passEdit.text.toString().trim())
                     .apply()
                 log("Настройки сохранены")
+            }
+            .setNegativeButton("Отмена", null)
+            .show()
+    }
+}
+
+// ---------- Файлы устройства (📁): флэш LittleFS и SD-карта ----------
+// API: GET /api/fs — список, GET /api/file — скачать,
+// POST /api/file — загрузить (потоково), DELETE — удалить.
+// Виртуальные пути устройства: "/flash/..." → LittleFS, "/sd/..." → SD.
+private data class FsEntry(val name: String, val dir: Boolean, val size: Long)
+
+class FileActivity : Activity() {
+    private lateinit var tvPath: TextView
+    private lateinit var tvStatus: TextView
+    private lateinit var list: ListView
+    private val exec = Executors.newSingleThreadExecutor()
+    private var cwd = "/"
+    private var entries: List<FsEntry> = emptyList()
+    private var selected = -1
+
+    private fun dp(v: Int): Int =
+        TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v.toFloat(),
+            resources.displayMetrics).toInt()
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        buildUi()
+        load()
+    }
+
+    override fun onDestroy() {
+        exec.shutdownNow()
+        super.onDestroy()
+    }
+
+    private fun buildUi() {
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+        }
+
+        val head = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        tvPath = TextView(this).apply {
+            textSize = 15f
+            gravity = android.view.Gravity.CENTER_VERTICAL
+        }
+        head.addView(tvPath, LinearLayout.LayoutParams(0,
+            LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        head.addView(Button(this).apply {
+            text = "↻"
+            setOnClickListener { load() }
+        }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT, 0f))
+        root.addView(head, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+
+        list = ListView(this).apply { choiceMode = ListView.CHOICE_MODE_SINGLE }
+        root.addView(list, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+
+        val row1 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        row1.addView(Button(this).apply {
+            text = "↑ Наверх"
+            textSize = 12f
+            setOnClickListener { goUp() }
+        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        row1.addView(Button(this).apply {
+            text = "⬆ На ESP"
+            textSize = 12f
+            setOnClickListener { pickUpload() }
+        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        root.addView(row1, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+
+        val row2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        row2.addView(Button(this).apply {
+            text = "⬇ Скачать"
+            textSize = 12f
+            setOnClickListener { downloadSelected() }
+        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        row2.addView(Button(this).apply {
+            text = "🗑 Удалить"
+            textSize = 12f
+            setOnClickListener { deleteSelected() }
+        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        root.addView(row2, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+
+        tvStatus = TextView(this).apply {
+            textSize = 13f
+            setTextColor(0xFF8FA3BF.toInt())
+            setPadding(0, dp(6), 0, 0)
+        }
+        root.addView(tvStatus)
+
+        // По нажатию: папка — войти, файл — выбрать/снять выбор
+        list.setOnItemClickListener { _, _, pos, _ ->
+            val e = entries.getOrNull(pos) ?: return@setOnItemClickListener
+            if (e.dir) {
+                cwd = (if (cwd.endsWith("/")) cwd else "$cwd/") + e.name
+                selected = -1
+                load()
+            } else {
+                selected = if (selected == pos) -1 else pos
+                render()
+            }
+        }
+
+        setContentView(root)
+    }
+
+    private fun status(msg: String) = runOnUiThread { tvStatus.text = msg }
+
+    private fun full(name: String) =
+        if (cwd.endsWith("/")) cwd + name else "$cwd/$name"
+
+    private fun humanSize(n: Long): String = when {
+        n >= 1_048_576L -> "%.1f МБ".format(n / 1_048_576.0)
+        n >= 1024L      -> "%d КБ".format(n / 1024)
+        else            -> "$n Б"
+    }
+
+    private fun render() {
+        runOnUiThread {
+            val rows = entries.mapIndexed { i, e ->
+                val icon = if (e.dir) "📁" else "📄"
+                val size = if (e.dir) "" else "   ${humanSize(e.size)}"
+                (if (i == selected) "✔ " else " ") + "$icon ${e.name}$size"
+            }
+            list.adapter = ArrayAdapter(this,
+                android.R.layout.simple_list_item_1, rows)
+            tvPath.text = cwd
+        }
+    }
+
+    private fun load() {
+        val path = cwd
+        status("Читаю $path…")
+        exec.execute {
+            try {
+                val (code, data) = espRequest("/api/fs?path=" +
+                    URLEncoder.encode(path, "UTF-8"))
+                if (code != 200) throw IOException("HTTP $code")
+                val arr = JSONArray(String(data, Charsets.UTF_8))
+                val items = ArrayList<FsEntry>(arr.length())
+                for (i in 0 until arr.length()) {
+                    val o = arr.getJSONObject(i)
+                    items.add(FsEntry(o.getString("n"),
+                        o.optInt("d") == 1, o.optLong("s")))
+                }
+                entries = items.sortedWith(
+                    compareBy({ !it.dir }, { it.name.lowercase() }))
+                selected = -1
+                render()
+                status("Элементов: ${entries.size}")
+            } catch (e: Exception) {
+                status("Ошибка: ${e.message}")
+            }
+        }
+    }
+
+    private fun goUp() {
+        if (cwd == "/") return
+        cwd = if (cwd == "/flash" || cwd == "/sd") "/"
+              else cwd.substringBeforeLast('/', "/")
+        selected = -1
+        load()
+    }
+
+    // ---- загрузка файла с телефона на устройство ----
+
+    private fun pickUpload() {
+        if (cwd == "/") { status("Войдите в папку: flash или sd"); return }
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+            .addCategory(Intent.CATEGORY_OPENABLE)
+            .setType("*/*")
+        startActivityForResult(intent, 200)
+    }
+
+    private fun displayName(uri: Uri): String {
+        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME),
+            null, null, null)?.use { c ->
+            if (c.moveToFirst()) {
+                val i = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (i >= 0) return c.getString(i) ?: "file"
+            }
+        }
+        return uri.lastPathSegment ?: "file"
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != 200 || resultCode != RESULT_OK) return
+        val uri = data?.data ?: return
+        val name = displayName(uri)
+        exec.execute {
+            try {
+                val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                    ?: throw IOException("не удалось прочитать файл")
+                status("Загрузка $name (${bytes.size / 1024} КБ)…")
+                val (code, _) = espRequest("/api/file?path=" +
+                    URLEncoder.encode(full(name), "UTF-8"), "POST", null, bytes)
+                if (code != 200) throw IOException("HTTP $code")
+                status("Загружено: $name")
+                load()
+            } catch (e: Exception) {
+                status("Ошибка: ${e.message}")
+            }
+        }
+    }
+
+    // ---- скачивание файла с устройства в «Загрузки» телефона ----
+
+    private fun downloadSelected() {
+        val e = entries.getOrNull(selected)
+        if (e == null) { status("Выберите файл (нажмите на строку)"); return }
+        if (e.dir) { status("Это папка — войдите в неё"); return }
+        exec.execute {
+            try {
+                status("Скачиваю ${e.name}…")
+                val (code, data) = espRequest("/api/file?path=" +
+                    URLEncoder.encode(full(e.name), "UTF-8"))
+                if (code != 200 || data.isEmpty()) throw IOException("HTTP $code")
+                val values = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, e.name)
+                    put(MediaStore.MediaColumns.MIME_TYPE, "application/octet-stream")
+                    put(MediaStore.MediaColumns.RELATIVE_PATH,
+                        Environment.DIRECTORY_DOWNLOADS)
+                }
+                val uri = contentResolver.insert(
+                    MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                    ?: throw IOException("MediaStore недоступен")
+                contentResolver.openOutputStream(uri)?.use { it.write(data) }
+                    ?: throw IOException("нет потока записи")
+                status("Сохранено в Загрузки: ${e.name}")
+            } catch (ex: Exception) {
+                status("Ошибка: ${ex.message}")
+            }
+        }
+    }
+
+    // ---- удаление ----
+
+    private fun deleteSelected() {
+        val e = entries.getOrNull(selected)
+        if (e == null) { status("Выберите элемент"); return }
+        val target = full(e.name)
+        AlertDialog.Builder(this)
+            .setTitle("Удалить?")
+            .setMessage(target + if (e.dir) "\n(папка должна быть пустой)" else "")
+            .setPositiveButton("Удалить") { _, _ ->
+                exec.execute {
+                    try {
+                        status("Удаляю ${e.name}…")
+                        val (code, _) = espRequest("/api/file?path=" +
+                            URLEncoder.encode(target, "UTF-8"), "DELETE")
+                        if (code != 200) throw IOException("HTTP $code")
+                        status("Удалено: ${e.name}")
+                        load()
+                    } catch (ex: Exception) {
+                        status("Ошибка: ${ex.message}")
+                    }
+                }
             }
             .setNegativeButton("Отмена", null)
             .show()

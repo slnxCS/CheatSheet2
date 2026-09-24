@@ -280,8 +280,36 @@ static uint32_t measure_sharpness() {
 
 // Полный проход: грубый перебор всего хода мотора + точная подстройка.
 // ~2-2.5 с. Возвращает позицию лучшей резкости.
-static int run_autofocus(int start_pos) {
+// fast=true — быстрый проход только вокруг прошлой позиции (~0.7 с);
+// если пик оказался на краю окна (фокус уехал) — полный проход.
+static int run_autofocus(int start_pos, bool fast = false) {
     if (!camera_is_ready() || !temp_buf) return start_pos;
+
+    if (fast) {
+        static const int NEAR[5] = {0, -32, 32, -64, 64};
+        int best = start_pos;
+        uint32_t bestm = 0;
+        bool at_edge = false;
+        for (int i = 0; i < 5; i++) {
+            int p = start_pos + NEAR[i];
+            if (p < 0 || p > 1023) continue;
+            camera_set_focus(p);
+            delay(5);
+            af_since_ms = millis();
+            uint32_t m = measure_sharpness();
+            if (m > bestm) { bestm = m; best = p; at_edge = (NEAR[i] != 0 && abs(NEAR[i]) == 64); }
+        }
+        if (bestm == 0) {                       // кадров нет — фокус не трогаем
+            camera_set_focus(start_pos);
+            return start_pos;
+        }
+        if (!at_edge) {                         // пик внутри окна — этого достаточно
+            camera_set_focus(best);
+            Serial.printf("AF fast: pos=%d sharp=%u\n", best, bestm);
+            return best;
+        }
+        Serial.println("AF fast: edge hit, full sweep");
+    }
 
     static const int COARSE[8] = {32, 160, 288, 416, 544, 672, 800, 928};
     int best = start_pos;
@@ -473,8 +501,8 @@ static void cap_task_fn(void*) {
             tmp_here = true;
         }
 
-        cap_stage = 1;   // автофокус
-        cam_focus = run_autofocus(cam_focus);
+        cap_stage = 1;   // автофокус (быстрый: вокруг прошлой позиции)
+        cam_focus = run_autofocus(cam_focus, /*fast=*/true);
 
         cap_stage = 2;   // снимок + сохранение
         uint8_t* jb = nullptr;
