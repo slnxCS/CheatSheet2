@@ -73,6 +73,8 @@ class MainActivity : Activity() {
     @Volatile private var pendingPhoto: ByteArray? = null
     private var lastSendSeen = 0L        // последний seen send с устройства
     private var reconnectPending = false  // запланировано авто-переподключение
+    private var bindFails = 0             // окно счётчика EPERM (шторм = ребуты ESP)
+    private var bindFailsWin = 0L
 
     private val prefs by lazy { getSharedPreferences("camlink", Context.MODE_PRIVATE) }
 
@@ -315,6 +317,15 @@ class MainActivity : Activity() {
             espNetwork = null
             btnQuick.isEnabled = false
             status("Переподключение к устройству…")
+
+            // 3+ обрыва в минуту = устройство не выдерживает нагрузки
+            // и перезагружается (просадка питания) — подсказать прямо
+            val now = System.currentTimeMillis()
+            if (now - bindFailsWin > 60_000) { bindFailsWin = now; bindFails = 0 }
+            if (++bindFails == 3)
+                log("! Частые обрывы — похоже, устройство перезагружается " +
+                    "под нагрузкой. Проверьте питание: 5.0V под нагрузкой, " +
+                    "≥2A, конденсатор 470–1000µF.")
         }
         scheduleAutoReconnect()
     }
