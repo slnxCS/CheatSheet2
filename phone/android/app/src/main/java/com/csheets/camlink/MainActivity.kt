@@ -18,7 +18,6 @@ import android.provider.Settings
 import android.text.InputType
 import android.util.Base64
 import android.util.TypedValue
-import android.view.Gravity
 import android.view.View
 import android.widget.Button
 import android.widget.EditText
@@ -33,15 +32,21 @@ import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLEncoder
 import java.util.concurrent.Executors
 import kotlin.concurrent.thread
 
 /*
- * CamLink — мост «устройство CheatSheet2 → телефон → ИИ → ответ обратно на устройство».
+ * CamLink — посредник «телефон ⇄ устройство CheatSheet2 ⇄ ИИ».
  *
- * Подключение: WifiNetworkSpecifier (Android 10+) подключается к SoftAP «CSCAM»
- * как к ЛОКАЛЬНОЙ сети — телефон остаётся на мобильном интернете для запроса к ИИ.
- * Переброс фото/ответа: HTTP на 192.168.4.1 (сокет привязан к сети ESP).
+ * Сам чат живёт на УСТРОЙСТВЕ (экран «ИИ»). Телефон только:
+ *   1) принимает текст с клавиатуры и фото (устройство / галерея),
+ *   2) немедленно шлёт вопрос на устройство (POST /api/question),
+ *   3) спрашивает ИИ через мобильный интернет,
+ *   4) доставляет ответ (POST /api/answer) — он дописывается в вопрос.
+ *
+ * Подключение: WifiNetworkSpecifier (Android 10+) — локальная сеть к SoftAP
+ * «CSCAM», мобильный интернет остаётся для API ИИ.
  */
 class MainActivity : Activity() {
 
@@ -57,12 +62,15 @@ class MainActivity : Activity() {
     private lateinit var cm: ConnectivityManager
     private lateinit var tvStatus: TextView
     private lateinit var tvLog: TextView
-    private lateinit var btnAsk: Button
+    private lateinit var etInput: EditText
+    private lateinit var btnSend: Button
+    private lateinit var btnQuick: Button
     private val mainHandler = Handler(Looper.getMainLooper())
     private val exec = Executors.newSingleThreadExecutor()
 
     @Volatile private var espNetwork: Network? = null
     private var netCallback: ConnectivityManager.NetworkCallback? = null
+    @Volatile private var pendingPhoto: ByteArray? = null
 
     private val prefs by lazy { getSharedPreferences("camlink", Context.MODE_PRIVATE) }
 
@@ -90,41 +98,67 @@ class MainActivity : Activity() {
     private fun buildUi() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(16), dp(16), dp(16))
+            setPadding(dp(12), dp(10), dp(12), dp(10))
         }
 
         root.addView(TextView(this).apply {
             text = "🔗 CamLink — мост к ИИ"
-            textSize = 22f
-            setPadding(0, 0, 0, dp(4))
+            textSize = 18f
+            setPadding(0, 0, 0, dp(2))
         })
 
         tvStatus = TextView(this).apply {
             text = "Подключение к CSCAM…"
-            textSize = 14f
-            setPadding(0, 0, 0, dp(12))
+            textSize = 13f
+            setTextColor(0xFF8FA3BF.toInt())
+            setPadding(0, 0, 0, dp(6))
         }
         root.addView(tvStatus)
 
-        btnAsk = Button(this).apply {
-            text = "Спросить ИИ о последнем фото"
-            setOnClickListener { askAi() }
+        // Клавиатура телефона → вопрос на устройство → ответ ИИ обратно
+        val inputRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val btnAttach = Button(this).apply {
+            text = "📎"
+            setOnClickListener { attachMenu() }
         }
-        root.addView(btnAsk, LinearLayout.LayoutParams(
+        inputRow.addView(btnAttach, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT, 0f))
+        etInput = EditText(this).apply {
+            hint = "Вопрос для ИИ…"
+            maxLines = 3
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+        }
+        inputRow.addView(etInput, LinearLayout.LayoutParams(
+            0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        btnSend = Button(this).apply {
+            text = "→"
+            setOnClickListener { send() }
+        }
+        inputRow.addView(btnSend, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT, 0f))
+        root.addView(inputRow, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
 
-        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        row.addView(Button(this).apply {
-            text = "⚙ Настройки"
+        val actionRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        btnQuick = Button(this).apply {
+            text = "📷 Спросить о фото"
+            textSize = 13f
+            isEnabled = false
+            setOnClickListener { quickAsk() }
+        }
+        actionRow.addView(btnQuick, LinearLayout.LayoutParams(
+            0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        actionRow.addView(Button(this).apply {
+            text = "⚙"
             setOnClickListener { openSettings() }
-        })
-        row.addView(Button(this).apply {
-            text = "↻ Связь"
-            setOnClickListener {
-                reconnectEsp()
-            }
-        })
-        root.addView(row, LinearLayout.LayoutParams(
+        }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT, 0f))
+        actionRow.addView(Button(this).apply {
+            text = "↻"
+            setOnClickListener { reconnectEsp() }
+        }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT, 0f))
+        root.addView(actionRow, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
 
         val scroll = ScrollView(this).apply {
@@ -144,6 +178,9 @@ class MainActivity : Activity() {
     private fun log(msg: String) {
         mainHandler.post {
             tvLog.append(msg + "\n")
+            (tvLog.parent as? ScrollView)?.post {
+                (tvLog.parent as ScrollView).fullScroll(View.FOCUS_DOWN)
+            }
         }
     }
 
@@ -162,7 +199,7 @@ class MainActivity : Activity() {
         if (!wifi.isWifiEnabled) {
             status("WiFi выключен — включаю настройки")
             startActivity(Intent(Settings.ACTION_WIFI_SETTINGS))
-            log("! Включите WiFi и вернитесь в приложение (кнопка «Связь»)")
+            log("! Включите WiFi и вернитесь в приложение (кнопка ↻)")
         }
 
         val ssid = prefs.getString("ssid", "CSCAM")!!
@@ -189,17 +226,19 @@ class MainActivity : Activity() {
             override fun onAvailable(network: Network) {
                 espNetwork = network
                 log("✔ Подключено к устройству ($ssid)")
-                status("Подключено к устройству — можно спрашивать ИИ")
+                status("Подключено — чат на устройстве")
+                mainHandler.post { btnQuick.isEnabled = true }
             }
 
             override fun onLost(network: Network) {
                 if (espNetwork == network) espNetwork = null
-                log("✖ Связь с устройством потеряна (нажмите «Связь»)")
+                log("✖ Связь с устройством потеряна (нажмите ↻)")
                 status("Нет связи с устройством")
+                mainHandler.post { btnQuick.isEnabled = false }
             }
 
             override fun onUnavailable() {
-                status("Не удалось подключиться — нажмите «Связь»")
+                status("Не удалось подключиться — нажмите ↻")
                 log("✖ Диалог подключения не подтверждён")
             }
         }
@@ -224,12 +263,12 @@ class MainActivity : Activity() {
                            body: ByteArray? = null): Pair<Int, ByteArray> {
         val net = espNetwork ?: throw IOException("нет связи с устройством")
         val url = URL("http://$ESP_IP$path")
-        val conn = url.openConnection() as HttpURLConnection
+        // Network.openConnection — трафик идёт только по сети ESP
+        val conn = net.openConnection(url) as HttpURLConnection
         conn.apply {
             connectTimeout = 5_000
             readTimeout = if (path == "/api/photo") 20_000 else 8_000
             requestMethod = method
-            socketFactory = net.socketFactory      // ← трафик только в сеть ESP
             headers?.forEach { (k, v) -> setRequestProperty(k, v) }
             if (body != null) {
                 doOutput = true
@@ -252,67 +291,151 @@ class MainActivity : Activity() {
         return code to data
     }
 
-    private fun espGetJson(path: String): JSONObject {
-        val (code, data) = espRequest(path)
-        if (code != 200) throw IOException("HTTP $code с устройства")
-        return JSONObject(String(data, Charsets.UTF_8))
-    }
+    // ---------- Отправка ----------
 
-    // ---------- Основной сценарий ----------
+    // Текст (± фото) → вопрос сразу на устройство → ИИ → ответ на устройство
+    private fun send() {
+        val text = etInput.text.toString().trim()
+        val photo = pendingPhoto
+        if (text.isEmpty() && photo == null) return
+        etInput.setText("")
+        if (text.isNotEmpty()) log("→ $text")
 
-    private fun askAi() {
-        if (espNetwork == null) {
-            status("Нет связи с устройством — нажмите «Связь»")
-            return
+        btnSend.isEnabled = false
+        val headers = mutableMapOf("X-Id" to "chat")
+        if (text.isNotEmpty())
+            headers["X-Question"] = URLEncoder.encode(text, "UTF-8")
+
+        // 1) вопрос мгновенно в чат устройства (пузырь «…»)
+        if (text.isNotEmpty()) {
+            exec.execute {
+                try {
+                    val (code, _) = espRequest("/api/question", "POST",
+                        mapOf("X-Question" to headers["X-Question"]!!), ByteArray(0))
+                    if (code != 200) log("устройство: вопрос не принят (HTTP $code)")
+                } catch (e: Exception) {
+                    log("вопрос не доставлен: ${e.message}")
+                }
+            }
         }
-        btnAsk.isEnabled = false
+
+        // 2) ИИ через мобильный интернет, 3) ответ обратно
         exec.execute {
             try {
-                status("Проверяю фото на устройстве…")
-                val st = espGetJson("/api/state")
-                val state = st.getInt("state")
-                val id = st.getInt("id")
-                when (state) {
-                    0 -> {
-                        status("Фото нет — снимите его на устройстве")
-                        log("Очередь пуста (state=0)")
-                        return@execute
-                    }
-                    3 -> log("Есть прошлый ответ (#${st.getInt("seq")}), беру свежее фото")
+                status("ИИ думает…")
+                val answer = callAi(photo, text).trim()
+                log("← $answer")
+                pendingPhoto = null
+
+                // ответ (с дублем вопроса — если шаг 1 не прошл, он станет новым обменом)
+                val (code, _) = espRequest("/api/answer", "POST",
+                    headers + ("Content-Type" to "text/plain; charset=utf-8"),
+                    answer.take(ANSWER_MAX).toByteArray(Charsets.UTF_8))
+                if (code == 200) status("Готово — ответ на экране устройства")
+                else { log("устройство: ответ не принят (HTTP $code)"); status("ИИ ответил, устройство недоступно") }
+            } catch (e: Exception) {
+                log("ОШИБКА: ${e.message}")
+                status("Ошибка: ${e.message}")
+                // сорванный вопрос не должен остаться «…» навсегда
+                try {
+                    if (text.isNotEmpty())
+                        espRequest("/api/answer", "POST",
+                            headers + ("Content-Type" to "text/plain; charset=utf-8"),
+                            "⚠ ${e.message}".toByteArray(Charsets.UTF_8))
+                } catch (_: Exception) {}
+            } finally {
+                mainHandler.post { btnSend.isEnabled = true }
+            }
+        }
+    }
+
+    // Быстрый сценарий: фото уже на устройстве — один тап, без вопроса
+    private fun quickAsk() {
+        btnQuick.isEnabled = false
+        exec.execute {
+            try {
+                val (sc, sd) = espRequest("/api/state")
+                if (sc != 200) throw IOException("устройство недоступно (HTTP $sc)")
+                val st = JSONObject(String(sd, Charsets.UTF_8))
+                if (st.getInt("id") == 0) {
+                    status("Фото нет — снимите его на устройстве")
+                    return@execute
                 }
-                if (id == 0) return@execute
 
                 status("Качаю фото с устройства…")
                 val (pcode, photo) = espRequest("/api/photo")
-                if (pcode != 200 || photo.isEmpty()) throw IOException("фото недоступно (HTTP $pcode)")
-                log("Фото получено: ${photo.size / 1024} КБ")
-
-                status("Готовлю изображение…")
-                val resized = resize(photo, 1568, 85)
-                log("Сжато для ИИ: ${resized.size / 1024} КБ")
+                if (pcode != 200 || photo.isEmpty())
+                    throw IOException("фото недоступно (HTTP $pcode)")
+                log("Фото: ${photo.size / 1024} КБ")
 
                 status("ИИ думает…")
-                val answer = callAi(resized).trim()
-                log("ИИ ответил (${answer.length} симв.)")
+                val answer = callAi(photo, "").trim()
+                log("← $answer")
 
-                status("Отправляю ответ на устройство…")
-                val answerBytes = answer.take(ANSWER_MAX).toByteArray(Charsets.UTF_8)
-                val (acode, adata) = espRequest(
-                    "/api/answer", "POST",
-                    mapOf("X-Id" to id.toString(), "Content-Type" to "text/plain; charset=utf-8"),
-                    answerBytes
-                )
-                if (acode != 200) throw IOException("ответ не принят (HTTP $acode)")
-
-                status("✅ Готово! Ответ показан на экране устройства")
-                log("Ответ доставлен (для фото #$id)")
+                val (code, _) = espRequest("/api/answer", "POST",
+                    mapOf("X-Id" to "quick",
+                        "Content-Type" to "text/plain; charset=utf-8"),
+                    answer.take(ANSWER_MAX).toByteArray(Charsets.UTF_8))
+                if (code == 200) status("Готово — ответ на экране устройства")
+                else status("ответ не принят (HTTP $code)")
             } catch (e: Exception) {
-                status("Ошибка: ${e.message}")
                 log("ОШИБКА: ${e.message}")
+                status("Ошибка: ${e.message}")
             } finally {
-                mainHandler.post { btnAsk.isEnabled = true }
+                mainHandler.post { btnQuick.isEnabled = espNetwork != null }
             }
         }
+    }
+
+    // ---------- Прикрепление фото ----------
+
+    private fun attachMenu() {
+        AlertDialog.Builder(this)
+            .setTitle("Прикрепить фото")
+            .setItems(arrayOf("Фото с устройства", "Фото из галереи")) { _, which ->
+                if (which == 0) attachFromDevice() else pickFromGallery()
+            }
+            .setNegativeButton("Отмена", null)
+            .show()
+    }
+
+    private fun attachFromDevice() {
+        exec.execute {
+            try {
+                val (pcode, photo) = espRequest("/api/photo")
+                if (pcode != 200 || photo.isEmpty())
+                    throw IOException("нет фото на устройстве (HTTP $pcode)")
+                pendingPhoto = photo
+                log("📎 Фото с устройства прикреплено (${photo.size / 1024} КБ)")
+                status("Фото прикреплено — введите вопрос")
+            } catch (e: Exception) {
+                status(e.message ?: "Ошибка")
+            }
+        }
+    }
+
+    private fun pickFromGallery() {
+        val intent = Intent(Intent.ACTION_GET_CONTENT)
+            .addCategory(Intent.CATEGORY_OPENABLE)
+            .setType("image/*")
+        startActivityForResult(intent, 100)
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != 100 || resultCode != RESULT_OK) return
+        val uri = data?.data ?: return
+        thread {
+            try {
+                val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                    ?: throw IOException("не удалось прочитать фото")
+                pendingPhoto = bytes
+                log("📎 Фото из галереи прикреплено (${bytes.size / 1024} КБ)")
+                status("Фото прикреплено — введите вопрос")
+            } catch (e: Exception) {
+                status(e.message ?: "Ошибка")
+            }
+        }.start()
     }
 
     // ---------- Изображение ----------
@@ -334,14 +457,24 @@ class MainActivity : Activity() {
 
     // ---------- Вызов API ИИ (через мобильный интернет) ----------
 
-    private fun callAi(jpeg: ByteArray): String {
+    private fun callAi(photo: ByteArray?, userText: String): String {
         val key = prefs.getString("key", "")!!
-        if (key.isBlank()) throw IOException("нет API-ключа (Настройки)")
+        if (key.isBlank()) throw IOException("нет API-ключа (⚙ Настройки)")
         val provider = prefs.getString("provider", "gemini")!!
+
+        if (photo == null) {   // текстовый вопрос
+            return if (provider == "openai") openAiText(key, userText)
+                   else geminiText(key, userText)
+        }
+
+        // Фото: промпт-инструкция (+ вопрос пользователя, если был набран)
         val prompt = prefs.getString("prompt", DEFAULT_PROMPT)!!
-        val b64 = Base64.encodeToString(jpeg, Base64.NO_WRAP)
-        return if (provider == "openai") callOpenAi(key, prompt, b64)
-               else callGemini(key, prompt, b64)
+        val visionPrompt =
+            if (userText.isEmpty()) prompt else "$prompt\n\nВопрос: $userText"
+        val resized = resize(photo, 1568, 85)
+        val b64 = Base64.encodeToString(resized, Base64.NO_WRAP)
+        return if (provider == "openai") callOpenAi(key, visionPrompt, b64)
+               else callGemini(key, visionPrompt, b64)
     }
 
     private fun postJson(urlStr: String, json: JSONObject,
@@ -367,6 +500,30 @@ class MainActivity : Activity() {
             throw IOException("API HTTP $code: $msg")
         }
         return JSONObject(text)
+    }
+
+    private fun openAiText(key: String, text: String): String {
+        val body = JSONObject()
+            .put("model", "gpt-4o-mini")
+            .put("max_tokens", 1200)
+            .put("messages", JSONArray().put(
+                JSONObject().put("role", "user").put("content", text)))
+        val resp = postJson("https://api.openai.com/v1/chat/completions", body,
+            mapOf("Authorization" to "Bearer $key"))
+        return resp.getJSONArray("choices")
+            .getJSONObject(0).getJSONObject("message").getString("content")
+    }
+
+    private fun geminiText(key: String, text: String): String {
+        val body = JSONObject().put("contents", JSONArray().put(
+            JSONObject().put("role", "user")
+                .put("parts", JSONArray().put(JSONObject().put("text", text)))))
+        val resp = postJson(
+            "https://generativelanguage.googleapis.com/v1beta/models/" +
+            "gemini-2.0-flash:generateContent?key=$key", body)
+        val cand = resp.getJSONArray("candidates").getJSONObject(0)
+        return cand.getJSONObject("content").getJSONArray("parts")
+            .getJSONObject(0).getString("text")
     }
 
     private fun callOpenAi(key: String, prompt: String, b64: String): String {
@@ -425,10 +582,11 @@ class MainActivity : Activity() {
         layout.addView(keyEdit)
 
         layout.addView(TextView(this).apply {
-            text = "Промпт"; setPadding(0, dp(12), 0, 0)
+            text = "Промпт (для фото)"
+            setPadding(0, dp(12), 0, 0)
         })
         val promptEdit = EditText(this).apply {
-            hint = "Что спрашивать у ИИ"
+            hint = "Что спрашивать у ИИ по фото"
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
             minLines = 3
             setText(prefs.getString("prompt", DEFAULT_PROMPT))

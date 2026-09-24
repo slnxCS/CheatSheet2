@@ -32,6 +32,7 @@ static AiLinkState state = AI_LINK_IDLE;
 static char       answer_buf[ANSWER_MAX];
 static size_t     answer_len = 0;
 static uint32_t   answer_seq = 0;
+static uint32_t   ui_seq = 0;      // любое событие чата → автооткрытия экрана
 
 // Кольцо истории: без memmove, head — слот следующей записи
 static AiHistEntry hist[AI_HIST_MAX];
@@ -179,14 +180,70 @@ static void hist_add(uint8_t type, const char* q, const char* a) {
     hist_head = (hist_head + 1) % AI_HIST_MAX;
     if (hist_cnt < AI_HIST_MAX) hist_cnt++;
     hist_seq++;
-    if (type == 1) {           // ответ — триггер автооткрытия экрана
+    if (type == 1) {           // полный обмен — автооткрытие + «ответ получен»
         answer_seq++;
         state = AI_LINK_ANSWERED;
+        ui_seq++;
+    } else if (type == 2) {     // вопрос с телефона — тоже показать чат
+        ui_seq++;
     }
     int phys = (hist_head - 1 + AI_HIST_MAX) % AI_HIST_MAX;
     portEXIT_CRITICAL(&lk_mux);
 
     persist_append(phys);
+}
+
+// Переписать файл истории актуальными строками (компактизация / дозапись)
+static void persist_rewrite() {
+    if (!hist_file_sem) return;
+    xSemaphoreTake(hist_file_sem, portMAX_DELAY);
+    File w = LittleFS.open(HIST_FILE, FILE_WRITE);
+    if (w) {
+        for (int i = 0; i < hist_cnt; i++) {
+            int phys = (hist_head - hist_cnt + i + AI_HIST_MAX * 2) % AI_HIST_MAX;
+            AiHistEntry e;
+            portENTER_CRITICAL(&lk_mux);
+            e = hist[phys];
+            portEXIT_CRITICAL(&lk_mux);
+            size_t pos = 0;
+            pers_line[pos++] = (char)('0' + e.type);
+            pers_line[pos++] = '\x1f';
+            esc_write(pers_line, sizeof(pers_line), &pos, e.time);
+            pers_line[pos++] = '\x1f';
+            esc_write(pers_line, sizeof(pers_line), &pos, e.q);
+            pers_line[pos++] = '\x1f';
+            esc_write(pers_line, sizeof(pers_line), &pos, e.a);
+            pers_line[pos++] = '\n';
+            pers_line[pos] = '\0';
+            w.print(pers_line);
+        }
+        w.close();
+    }
+    xSemaphoreGive(hist_file_sem);
+}
+
+// Ответ пришёл на последний «висящий» вопрос (type=2) — дописать его туда.
+// false = висящего вопроса нет, вызывающий должен дописать новый обмен.
+static bool hist_fill_last_answer(const char* a) {
+    bool filled = false;
+    portENTER_CRITICAL(&lk_mux);
+    if (hist_cnt > 0) {
+        int phys = (hist_head - 1 + AI_HIST_MAX) % AI_HIST_MAX;
+        if (hist[phys].type == 2) {
+            strncpy(hist[phys].a, a ? a : "", AI_HIST_A - 1);
+            utf8_cut(hist[phys].a, AI_HIST_A);
+            hist[phys].type = 1;
+            hist_seq++;
+            ui_seq++;
+            answer_seq++;
+            state = AI_LINK_ANSWERED;
+            filled = true;
+        }
+    }
+    portEXIT_CRITICAL(&lk_mux);
+
+    if (filled) persist_rewrite();   // строка в файле уже лежит — переписать
+    return filled;
 }
 
 // Загрузка истории из файла + компактизация (файл ≤ AI_HIST_MAX строк)
@@ -214,7 +271,7 @@ static void hist_load() {
             uint8_t type = (uint8_t)(line[0] - '0');
             char* f1 = strchr(line + 2, '\x1f');               // конец time
             char* f2 = f1 ? strchr(f1 + 1, '\x1f') : nullptr;  // конец q
-            if (type <= 1 && f1 && f2) {
+            if (type <= 2 && f1 && f2) {
                 *f1 = '\0';
                 *f2 = '\0';
                 AiHistEntry& e = hist[hist_head];
@@ -231,30 +288,8 @@ static void hist_load() {
     }
     free(buf);
 
-    // Компактизация: переписать файл только актуальными строками
-    if (hist_file_sem && xSemaphoreTake(hist_file_sem, portMAX_DELAY) == pdTRUE) {
-        File w = LittleFS.open(HIST_FILE, FILE_WRITE);
-        if (w) {
-            for (int i = 0; i < hist_cnt; i++) {
-                int phys = (hist_head - hist_cnt + i + AI_HIST_MAX * 2) % AI_HIST_MAX;
-                const AiHistEntry& e = hist[phys];
-                size_t pos = 0;
-                pers_line[pos++] = (char)('0' + e.type);
-                pers_line[pos++] = '\x1f';
-                esc_write(pers_line, sizeof(pers_line), &pos, e.time);
-                pers_line[pos++] = '\x1f';
-                esc_write(pers_line, sizeof(pers_line), &pos, e.q);
-                pers_line[pos++] = '\x1f';
-                esc_write(pers_line, sizeof(pers_line), &pos, e.a);
-                pers_line[pos++] = '\n';
-                pers_line[pos] = '\0';
-                w.print(pers_line);
-            }
-            w.close();
-        }
-        xSemaphoreGive(hist_file_sem);
-    }
-    if (hist_cnt) hist_seq = 1;  // есть прошлая переписка (не открывать экран)
+    persist_rewrite();            // компактизация: только актуальные строки
+    if (hist_cnt) hist_seq = 1;   // есть прошлая переписка (не открывать экран)
     Serial.printf("ai_link: history loaded (%d entries)\n", hist_cnt);
 }
 
@@ -387,7 +422,9 @@ static void handle_chat_reply() {
     answer_len = body.length();
     portEXIT_CRITICAL(&lk_mux);
 
-    hist_add(1, qdec, body.c_str());
+    // Сначала — дозапись в последний «висящий» вопрос, иначе новый обмен
+    if (!hist_fill_last_answer(body.c_str()))
+        hist_add(1, qdec, body.c_str());
 
     Serial.printf("ai_link: chat reply #%u (X-Id=%s, q=%u chars, a=%u chars)\n",
                   (unsigned)answer_seq, id_h.c_str(),
@@ -400,6 +437,22 @@ static void h_chat() { handle_chat_reply(); }
 
 // POST /api/answer — только ответ (обратная совместимость)
 static void h_answer() { handle_chat_reply(); }
+
+// POST /api/question — вопрос с телефона без ответа (type=2, рисуется «…»,
+// пока ИИ не ответит через /api/chat или /api/answer)
+static void h_question() {
+    String q_h = server.header("X-Question");
+    char qdec[AI_HIST_Q];
+    url_decode(q_h.c_str(), qdec, sizeof(qdec));
+    if (!qdec[0]) {
+        server.send(400, "text/plain", "no question");
+        return;
+    }
+    hist_add(2, qdec, "");
+    Serial.printf("ai_link: question from phone (%u chars)\n",
+                  (unsigned)strlen(qdec));
+    server.send(200, "text/plain", "ok");
+}
 
 // GET /api/history — вся переписка для телефона
 static void h_history() {
@@ -481,7 +534,7 @@ static void h_root() {
 // ---------- LVGL-таймер: автооткрытия экрана «ИИ» ----------
 
 static void poll_cb(lv_timer_t*) {
-    uint32_t seq = answer_seq;
+    uint32_t seq = ui_seq;   // вопрос или ответ — открыть чат в любом случае
     if (seq == 0) return;
     static uint32_t seen_seq = 0;
     if (seq == seen_seq) return;
@@ -529,6 +582,7 @@ void ai_link_init() {
     server.on("/", HTTP_GET, h_root);
     server.on("/api/state", HTTP_GET, h_state);
     server.on("/api/photo", HTTP_GET, h_photo);
+    server.on("/api/question", HTTP_POST, h_question);
     server.on("/api/chat", HTTP_POST, h_chat);
     server.on("/api/answer", HTTP_POST, h_answer);
     server.on("/api/history", HTTP_GET, h_history);

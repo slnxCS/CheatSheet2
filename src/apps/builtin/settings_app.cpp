@@ -55,7 +55,7 @@ static void highlight_items() {
 // Экран выше 240px (4 пункта) — прокрутить выбранный пункт на вид.
 // Вызывается только из навигации (при открытии layout ещё не посчитан).
 static void scroll_to_current() {
-    lv_obj_t* row = row_for_item(current_item);
+    lv_obj_t* row = row_for_item(current_item + 1);
     if (row) lv_obj_scroll_to_view(row, LV_ANIM_ON);
 }
 
