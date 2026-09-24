@@ -258,7 +258,9 @@ class MainActivity : Activity() {
         }
         netCallback = cb
         try {
-            cm.requestNetwork(request, cb, 30_000)
+            // Без таймаута: запрос держится, пока открыто приложение
+            // (сохранился сомнительный 30 с — мог рвать связь)
+            cm.requestNetwork(request, cb)
         } catch (e: SecurityException) {
             // старые сборки падали тут — нет CHANGE_NETWORK_STATE
             status("Нет разрешения сети: ${e.message}")
@@ -267,6 +269,13 @@ class MainActivity : Activity() {
             return
         }
         status("Подключение к устройству…")
+        // Подсказка, если системный диалог подключения не подтвердили
+        mainHandler.postDelayed({
+            if (espNetwork == null && netCallback == cb) {
+                status("Не подключено — нажмите ↻")
+                log("! Системный диалог подключения не подтверждён")
+            }
+        }, 45_000)
     }
 
     private fun reconnectEsp() {
