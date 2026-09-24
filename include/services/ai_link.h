@@ -17,7 +17,8 @@ typedef enum {
     AI_LINK_ANSWERED = 3,  // ответ получен
 } AiLinkState;
 
-void ai_link_init();                       // HTTP-сервер + LVGL-таймер автооткрытия
+void ai_link_init();                       // обработчики + LVGL-таймер автооткрытия
+void ai_link_ensure_server();              // запуск сервера, когда WiFi поднят
 void ai_link_notify_photo(fs::FS* f, const char* path);  // вызывается из save_photo
 
 AiLinkState ai_link_state();

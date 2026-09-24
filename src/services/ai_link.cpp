@@ -1,5 +1,6 @@
 #include "services/ai_link.h"
 #include "services/lang_service.h"
+#include "services/wifi_service.h"
 #include "ui/ui_manager.h"
 #include "ui/app_host.h"
 #include <Arduino.h>
@@ -25,6 +26,9 @@ static AiLinkState state = AI_LINK_IDLE;
 static char       answer_buf[ANSWER_MAX];
 static size_t     answer_len = 0;
 static uint32_t   answer_seq = 0;
+
+static volatile bool ai_ready = false;        // обработчики зарегистрированы
+static volatile bool server_started = false;  // server.begin() вызван
 
 // --- Геттеры (LVGL-поток) ---
 
@@ -227,9 +231,25 @@ static void poll_cb(lv_timer_t*) {
 
 static void http_task_fn(void*) {
     for (;;) {
-        server.handleClient();
+        // handleClient() безопасен только после begin(): до этого
+        // lwIP может быть вообще не инициализирован (WiFi выключен)
+        if (server_started) server.handleClient();
         vTaskDelay(pdMS_TO_TICKS(5));
     }
+}
+
+// Вызывается из ai_link_init и из wifi_service_start (когда AP поднят).
+// server.begin() создаёт lwIP-сокет — без инициализированного стека
+// это assert «Invalid mbox» и boot-loop с чёрным экраном.
+void ai_link_ensure_server() {
+    if (server_started || !ai_ready) return;
+    if (!wifi_service_running()) {
+        Serial.println("ai_link: server deferred (WiFi off)");
+        return;
+    }
+    server.begin();
+    server_started = true;
+    Serial.println("ai_link: HTTP server on :80");
 }
 
 void ai_link_init() {
@@ -239,10 +259,10 @@ void ai_link_init() {
     server.on("/api/state", HTTP_GET, h_state);
     server.on("/api/photo", HTTP_GET, h_photo);
     server.on("/api/answer", HTTP_POST, h_answer);
-    server.begin();
+    ai_ready = true;
 
     xTaskCreatePinnedToCore(http_task_fn, "ai_http", 8192, nullptr, 1, nullptr, 1);
 
     lv_timer_create(poll_cb, 300, nullptr);
-    Serial.println("ai_link: HTTP server on :80");
+    ai_link_ensure_server();   // если WiFi уже поднят — начинаем сразу
 }

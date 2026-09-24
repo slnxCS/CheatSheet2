@@ -1,4 +1,5 @@
 #include "services/wifi_service.h"
+#include "services/ai_link.h"
 #include "ui/widgets/status_bar.h"
 #include <WiFi.h>
 #include <Preferences.h>
@@ -11,6 +12,7 @@ void wifi_service_init() {
     prefs.begin("wifi", true);
     enabled = prefs.getBool("on", true);
     prefs.end();
+    Serial.printf("wifi: enabled=%d\n", enabled ? 1 : 0);
     if (enabled) wifi_service_start();
 }
 
@@ -28,6 +30,8 @@ bool wifi_service_start() {
     status_bar_set_wifi(true);
     Serial.printf("wifi: AP '%s' up, IP %s\n",
                   WIFI_AP_SSID, WiFi.softAPIP().toString().c_str());
+    // lwIP теперь инициализирован — можно поднимать HTTP-сервер
+    ai_link_ensure_server();
     return true;
 }
 

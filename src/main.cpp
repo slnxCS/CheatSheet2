@@ -183,7 +183,10 @@ void setup() {
 
     init_fs();
 
-    // WiFi SoftAP («CSCAM») + HTTP-мост «устройство → телефон → ИИ»
+    // WiFi SoftAP («CSCAM») + HTTP-мост «устройство → телефон → ИИ».
+    // Порядок важен: сначала WiFi (init может ничего не запустить, если
+    // выключен в настройках), затем ai_link — сервер начнётся только
+    // при реально поднятом AP (см. ai_link_ensure_server).
     Serial.println("[7/7] WiFi + AI link...");
     wifi_service_init();
     ai_link_init();
