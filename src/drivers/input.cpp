@@ -18,6 +18,7 @@ static bool btnLongFired[BTN_COUNT] = {false};
 
 // Repeat-fire state for directional buttons
 static bool btnRepeatActive[BTN_COUNT] = {false};
+static bool btnRepeatFired[BTN_COUNT] = {false};   // хоть один повтор был — подавить CLICKED на отпускании
 static uint32_t btnLastRepeat[BTN_COUNT] = {0};
 
 static ButtonCallback userCallback = nullptr;
@@ -41,6 +42,7 @@ void input_init() {
         btnPressStart[i] = 0;
         btnLongFired[i] = false;
         btnRepeatActive[i] = false;
+        btnRepeatFired[i] = false;
         btnLastRepeat[i] = 0;
     }
 }
@@ -68,12 +70,14 @@ void input_update() {
                     btnPressStart[i] = now;
                     btnLongFired[i] = false;
                     btnRepeatActive[i] = false;
+                    btnRepeatFired[i] = false;
                     btnLastRepeat[i] = now;
                     if (userCallback) userCallback((ButtonId)i, BTN_EVENT_PRESSED);
                 } else {
-                    // Button released
+                    // Button released: лишний CLICKED не нужен, если был
+                    // long или автоповтор уже накликал шагов
                     btnRepeatActive[i] = false;
-                    if (!btnLongFired[i] && userCallback) {
+                    if (!btnLongFired[i] && !btnRepeatFired[i] && userCallback) {
                         userCallback((ButtonId)i, BTN_EVENT_CLICKED);
                     }
                     if (userCallback) userCallback((ButtonId)i, BTN_EVENT_RELEASED);
@@ -87,10 +91,13 @@ void input_update() {
                 if (userCallback) userCallback((ButtonId)i, BTN_EVENT_LONG_PRESSED);
             }
 
-            // Repeat-fire for nav buttons (after long press threshold)
-            if (btnState[i] && is_nav_button(i) && !btnLongFired[i]) {
+            // Repeat-fire for nav buttons: весь период удержания (раньше
+            // умирал после long на 550 мс — удержание давало лишь всплеск
+            // из ~3 кликов)
+            if (btnState[i] && is_nav_button(i)) {
                 uint32_t held = now - btnPressStart[i];
                 if (held >= REPEAT_DELAY_MS) {
+                    btnRepeatFired[i] = true;
                     if (!btnRepeatActive[i]) {
                         // First repeat
                         btnRepeatActive[i] = true;
