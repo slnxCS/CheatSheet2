@@ -19,7 +19,7 @@ static lv_obj_t* btn_send  = nullptr;
 static lv_timer_t* timer   = nullptr;
 static uint32_t seen_hseq  = 0;
 static int focus_idx = 0;           // 0 = Сфоткать, 1 = Отправить
-static bool capturing = false;      // идёт снимок — кнопки не реагируют
+static int ui_cap_stage = -1;       // последний показанный этап фонового снимка
 static AiLinkState last_state = AI_LINK_IDLE;
 static AiHistEntry tmp;             // копия одной записи вне критической секции
 
@@ -145,6 +145,8 @@ static void rebuild_chat() {
     lv_obj_scroll_to_view(last, LV_ANIM_OFF);   // вниз к последнему
 }
 
+static void capture_stage(int stage, unsigned arg);
+
 static void refresh(lv_timer_t*) {
     AiLinkState st = ai_link_state();
     if (st != last_state) {
@@ -156,6 +158,14 @@ static void refresh(lv_timer_t*) {
     if (hseq != seen_hseq) {
         seen_hseq = hseq;
         rebuild_chat();
+    }
+
+    // Фоновый снимок (задача в camera_app): показываем смену этапов плашкой
+    unsigned kb = 0;
+    int cst = camera_app_capture_poll(&kb);
+    if (cst >= 0 && cst != ui_cap_stage) {
+        ui_cap_stage = cst;
+        capture_stage(cst, kb);
     }
 }
 
@@ -185,7 +195,7 @@ static lv_obj_t* make_action_btn(lv_obj_t* parent, const char* text) {
     return b;
 }
 
-// Этапы снимка — показываем плашку между блокирующими операциями
+// Этапы фонового снимка — опрашиваются из refresh(), LVGL только здесь
 static void capture_stage(int stage, unsigned arg) {
     char buf[80];
     lv_color_t bg = lv_color_hex(0x2C6FBF);
@@ -207,26 +217,36 @@ static void capture_stage(int stage, unsigned arg) {
                      LV_SYMBOL_OK, lang_str_camera_captured(), arg);
             bg = lv_color_hex(0x1B7F3B);
             break;
+        case 4:
+            snprintf(buf, sizeof(buf), "%s %s",
+                     LV_SYMBOL_WARNING, lang_str_camera_error());
+            bg = lv_color_hex(0xB33A3A);
+            break;
         default:
             return;
     }
-    toast_show(buf, stage == 3 ? 1500 : 0, bg);
-    lv_refr_now(lv_display_get_default());
-}
-
-static void action_capture() {
-    if (capturing) return;
-    capturing = true;
-    bool ok = camera_app_capture_headless(capture_stage);
-    capturing = false;
-    if (!ok)
-        toast_show(lang_str_camera_error(), 2000, lv_color_hex(0xB33A3A));
+    toast_show(buf, (stage == 3 || stage == 4) ? (stage == 3 ? 1500 : 2000) : 0, bg);
     // Успех: фото уже в истории чата (save_photo → ai_link_notify_photo),
     // лента обновится сама по hist_seq.
 }
 
+// идёт фоновый снимок (0..2)? — кнопки не реагируют
+static bool capture_busy() {
+    int st = camera_app_capture_poll(nullptr);
+    return st >= 0 && st <= 2;
+}
+
+static void action_capture() {
+    if (capture_busy()) return;
+    if (!camera_app_capture_start()) {
+        toast_show(lang_str_camera_error(), 2000, lv_color_hex(0xB33A3A));
+        return;
+    }
+    // Этапы и результат покажет refresh() по опросу camera_app_capture_poll
+}
+
 static void action_send() {
-    if (capturing) return;
+    if (capture_busy()) return;
     if (ai_link_request_send()) {
         // Телефон при следующем опросе увидит рост send и сам унесёт фото в ИИ
         toast_show(lang_str_ai_waiting(), 2000, lv_color_hex(0x2C6FBF));
@@ -245,7 +265,7 @@ void ai_answer_app_open(lv_obj_t* parent) {
     btn_send = nullptr;
     seen_hseq = 0;
     focus_idx = 0;
-    capturing = false;
+    ui_cap_stage = -1;
     last_state = AI_LINK_IDLE;
 
     lv_obj_set_style_bg_color(parent, lv_color_hex(0x0A1628), 0);
@@ -330,7 +350,6 @@ void ai_answer_app_close() {
     chat = nullptr;
     btn_photo = nullptr;
     btn_send = nullptr;
-    capturing = false;
 }
 
 void ai_answer_app_button(int button_id, int event) {

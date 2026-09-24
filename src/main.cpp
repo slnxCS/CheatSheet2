@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <esp_system.h>
 #include "config/pins.h"
 #include "drivers/display.h"
 #include "drivers/input.h"
@@ -123,6 +124,8 @@ void setup() {
     delay(1000);
 
     Serial.println("=== CheatSheet2 ===");
+    // Причина рестарта: 3=panic, 4=кормление WDT, 9=питание — ловим вылеты
+    Serial.printf("Reset reason: %d\n", (int)esp_reset_reason());
     Serial.printf("CPU freq: %d MHz\n", getCpuFrequencyMhz());
     Serial.printf("Free heap: %u bytes\n", (unsigned)ESP.getFreeHeap());
 

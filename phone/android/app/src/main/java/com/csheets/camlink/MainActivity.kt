@@ -257,7 +257,15 @@ class MainActivity : Activity() {
             }
         }
         netCallback = cb
-        cm.requestNetwork(request, cb, 30_000)
+        try {
+            cm.requestNetwork(request, cb, 30_000)
+        } catch (e: SecurityException) {
+            // старые сборки падали тут — нет CHANGE_NETWORK_STATE
+            status("Нет разрешения сети: ${e.message}")
+            log("requestNetwork: ${e.message}")
+            netCallback = null
+            return
+        }
         status("Подключение к устройству…")
     }
 

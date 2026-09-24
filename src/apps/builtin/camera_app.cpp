@@ -443,19 +443,24 @@ static bool save_photo(const uint8_t* jpeg_data, size_t jpeg_len, size_t* out_si
 
 // --- Снимок из другого приложения (кнопка «Сфоткать» в чате «ИИ») ---
 // Приложение камеры закрыто → камера не инициализирована: поднимаем её на
-// время снимка, гоняем тот же AF и сохраняем тем же save_photo. Блокирует
-// LVGL ~3-7 с; stage_cb между этапами — показать плашку и обновить экран.
-static volatile bool headless_busy = false;
+// время снимка, гоняем тот же AF и сохраняем тем же save_photo.
+//
+// Всё выполняется в ОТДЕЛЬНОЙ задаче с большим стеком на ядре 1: раньше
+// цепочка шла в loopTask (8 КБ, ядро 0) и перезагружала консоль, плюс
+// LVGL на несколько секунд замирал. LVGL только опрашивает cap_stage.
 
-bool camera_app_capture_headless(void (*stage_cb)(int, unsigned)) {
-    if (headless_busy || parent_ref) return false;   // камера занята/открыта
-    headless_busy = true;
+static volatile int      cap_stage = -1;   // -1 нет; 0..2 идёт; 3 успех; 4 ошибка
+static volatile unsigned cap_kb = 0;
+static volatile bool     cap_task_alive = false;
 
+static void cap_task_fn(void*) {
     bool ok = false;
     bool inited_here = false;
     bool tmp_here = false;
+    unsigned kb = 0;
 
-    if (stage_cb) stage_cb(0, 0);
+    Serial.println("cap: start");
+    cap_stage = 0;   // инициализация
 
     do {
         if (!camera_is_ready()) {
@@ -468,10 +473,10 @@ bool camera_app_capture_headless(void (*stage_cb)(int, unsigned)) {
             tmp_here = true;
         }
 
-        if (stage_cb) stage_cb(1, 0);
+        cap_stage = 1;   // автофокус
         cam_focus = run_autofocus(cam_focus);
 
-        if (stage_cb) stage_cb(2, 0);
+        cap_stage = 2;   // снимок + сохранение
         uint8_t* jb = nullptr;
         size_t jl = 0;
         if (!camera_capture(&jb, &jl)) break;
@@ -479,16 +484,50 @@ bool camera_app_capture_headless(void (*stage_cb)(int, unsigned)) {
         size_t saved = 0;
         ok = save_photo(jb, jl, &saved);   // внутри ставит фото в очередь ИИ
         camera_release();
-        if (ok && stage_cb) stage_cb(3, (unsigned)(saved / 1024));
+        kb = (unsigned)(saved / 1024);
     } while (0);
 
     if (tmp_here && temp_buf) { free(temp_buf); temp_buf = nullptr; }
     if (inited_here) camera_deinit();
-    headless_busy = false;
-    return ok;
+
+    cap_kb = kb;
+    cap_stage = ok ? 3 : 4;
+    cap_task_alive = false;
+    Serial.printf("cap: done ok=%d (%u KB)\n", ok ? 1 : 0, kb);
+    vTaskDelete(nullptr);
+}
+
+bool camera_app_capture_start() {
+    if (cap_task_alive || parent_ref) return false;   // уже идёт / камера открыта
+    cap_task_alive = true;
+    cap_kb = 0;
+    cap_stage = 0;
+    // 16 КБ стека — запас на AF + декод UXGA + JPEGENC с большим разбором
+    if (xTaskCreatePinnedToCore(cap_task_fn, "cam_cap", 16384, nullptr,
+                                2, nullptr, 1) != pdPASS) {
+        cap_task_alive = false;
+        cap_stage = -1;
+        Serial.println("cap: task create failed");
+        return false;
+    }
+    return true;
+}
+
+int camera_app_capture_poll(unsigned* kb) {
+    if (kb) *kb = cap_kb;
+    return cap_stage;
 }
 
 void camera_app_open(lv_obj_t* parent) {
+    // Фоновый снимок из чата «ИИ» ещё идёт — двойной camera_init = паника.
+    // Редкий случай: подождать окончания (снимок ≤ ~15 с).
+    uint32_t t0 = millis();
+    while (cap_task_alive && millis() - t0 < 15000) delay(10);
+    if (cap_task_alive) {
+        Serial.println("cam open: capture still running, abort");
+        return;
+    }
+
     parent_ref = parent;
     preview_active = false;
     saving = false;
