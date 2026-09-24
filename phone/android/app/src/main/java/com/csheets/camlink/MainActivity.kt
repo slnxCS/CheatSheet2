@@ -72,6 +72,7 @@ class MainActivity : Activity() {
     private var netCallback: ConnectivityManager.NetworkCallback? = null
     @Volatile private var pendingPhoto: ByteArray? = null
     private var lastSendSeen = 0L        // последний seen send с устройства
+    private var reconnectPending = false  // запланировано авто-переподключение
 
     private val prefs by lazy { getSharedPreferences("camlink", Context.MODE_PRIVATE) }
 
@@ -246,9 +247,10 @@ class MainActivity : Activity() {
 
             override fun onLost(network: Network) {
                 if (espNetwork == network) espNetwork = null
-                log("✖ Связь с устройством потеряна (нажмите ↻)")
-                status("Нет связи с устройством")
+                log("✖ Связь с устройством потеряна (ждите переподключения)")
+                status("Нет связи — жду переподключения…")
                 mainHandler.post { btnQuick.isEnabled = false }
+                scheduleAutoReconnect()
             }
 
             override fun onUnavailable() {
@@ -287,6 +289,36 @@ class MainActivity : Activity() {
         connectEsp()
     }
 
+    // Сеть выпала (перезагрузка устройства, уход с WiFi): перевыполнить
+    // запрос через 15 с — если onAvailable не придёт сам, зарегистрируем
+    // новый. Один флаг — без шквала повторов.
+    private fun scheduleAutoReconnect() {
+        mainHandler.post {
+            if (reconnectPending) return@post
+            reconnectPending = true
+            mainHandler.postDelayed({
+                reconnectPending = false
+                if (espNetwork == null) {
+                    log("↻ Авто-переподключение…")
+                    reconnectEsp()
+                }
+            }, 15_000)
+        }
+    }
+
+    // Сеть умерла между выбором и привязкой сокета
+    // («Binding socket to network N failed: EPERM/ENONET») — сбросить
+    // старую ссылку и дать цепочке восстановиться
+    private fun invalidateEsp(reason: String) {
+        mainHandler.post {
+            log("! Связь прервана: $reason")
+            espNetwork = null
+            btnQuick.isEnabled = false
+            status("Переподключение к устройству…")
+        }
+        scheduleAutoReconnect()
+    }
+
     // ---------- HTTP к устройству (сокет привязан к сети ESP) ----------
 
     private fun espRequest(path: String, method: String = "GET",
@@ -294,32 +326,42 @@ class MainActivity : Activity() {
                            body: ByteArray? = null): Pair<Int, ByteArray> {
         val net = espNetwork ?: throw IOException("нет связи с устройством")
         val url = URL("http://$ESP_IP$path")
-        // Network.openConnection — трафик идёт только по сети ESP
-        val conn = net.openConnection(url) as HttpURLConnection
-        conn.apply {
-            connectTimeout = 5_000
-            readTimeout = if (path == "/api/photo") 20_000 else 8_000
-            requestMethod = method
-            headers?.forEach { (k, v) -> setRequestProperty(k, v) }
-            if (body != null) {
-                doOutput = true
-                outputStream.use { it.write(body) }
+        try {
+            // Network.openConnection — трафик идёт только по сети ESP
+            val conn = net.openConnection(url) as HttpURLConnection
+            conn.apply {
+                connectTimeout = 5_000
+                readTimeout = if (path == "/api/photo") 20_000 else 8_000
+                requestMethod = method
+                headers?.forEach { (k, v) -> setRequestProperty(k, v) }
+                if (body != null) {
+                    doOutput = true
+                    outputStream.use { it.write(body) }
+                }
             }
+            val code = conn.responseCode
+            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+            val data = stream?.use { inp ->
+                val out = ByteArrayOutputStream()
+                val buf = ByteArray(16 * 1024)
+                while (true) {
+                    val n = inp.read(buf)
+                    if (n < 0) break
+                    out.write(buf, 0, n)
+                }
+                out.toByteArray()
+            } ?: ByteArray(0)
+            conn.disconnect()
+            return code to data
+        } catch (e: IOException) {
+            val m = e.message.orEmpty()
+            if (m.contains("Binding socket") || m.contains("EPERM") ||
+                m.contains("ENONET") || m.contains("unreachable")) {
+                invalidateEsp(e.message ?: "сеть недействительна")
+                throw IOException("сеть устройства пропала — переподключаюсь…")
+            }
+            throw e
         }
-        val code = conn.responseCode
-        val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-        val data = stream?.use { inp ->
-            val out = ByteArrayOutputStream()
-            val buf = ByteArray(16 * 1024)
-            while (true) {
-                val n = inp.read(buf)
-                if (n < 0) break
-                out.write(buf, 0, n)
-            }
-            out.toByteArray()
-        } ?: ByteArray(0)
-        conn.disconnect()
-        return code to data
     }
 
     // ---------- Отправка ----------
