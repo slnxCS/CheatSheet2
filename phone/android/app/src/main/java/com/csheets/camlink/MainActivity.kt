@@ -71,8 +71,20 @@ class MainActivity : Activity() {
     @Volatile private var espNetwork: Network? = null
     private var netCallback: ConnectivityManager.NetworkCallback? = null
     @Volatile private var pendingPhoto: ByteArray? = null
+    private var lastSendSeen = 0L        // последний seen send с устройства
 
     private val prefs by lazy { getSharedPreferences("camlink", Context.MODE_PRIVATE) }
+
+    // Устройство может само попросить отправить фото (кнопка «Отправить»
+    // в чате «ИИ») — опрашиваем /api/state и подхватываем.
+    private val pollRunnable = object : Runnable {
+        override fun run() {
+            if (espNetwork != null) {
+                exec.execute { pollSend() }
+            }
+            mainHandler.postDelayed(this, 2000)
+        }
+    }
 
     // ---------- Жизненный цикл ----------
 
@@ -80,9 +92,11 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         buildUi()
         connectEsp()
+        mainHandler.postDelayed(pollRunnable, 2000)
     }
 
     override fun onDestroy() {
+        mainHandler.removeCallbacks(pollRunnable)
         netCallback?.let { cm.unregisterNetworkCallback(it) }
         netCallback = null
         exec.shutdownNow()
@@ -349,35 +363,78 @@ class MainActivity : Activity() {
         }
     }
 
-    // Быстрый сценарий: фото уже на устройстве — один тап, без вопроса
+    // «Отправить» на устройстве → телефон сам: фото → вопрос → ИИ → ответ
+    private fun pollSend() {
+        try {
+            val (c, d) = espRequest("/api/state")
+            if (c != 200) return
+            val send = JSONObject(String(d, Charsets.UTF_8)).optLong("send", 0)
+            if (send > lastSendSeen) {
+                if (exec.isShutdown) return
+                lastSendSeen = send
+                log("Устройство просит отправить фото (#$send)")
+                runPhotoAsk()
+            }
+        } catch (_: Exception) {
+            // связи нет — просто ждём следующего опроса
+        }
+    }
+
+    // Общий сценарий «фото с устройства → ИИ → ответ»: и для кнопки «📷»,
+    // и для запроса «Отправить» с устройства. Вопрос берётся из последней
+    // «висящей» записи чата (пользователь мог набрать его на телефоне).
+    private fun runPhotoAsk() {
+        val (sc, sd) = espRequest("/api/state")
+        if (sc != 200) throw IOException("устройство недоступно (HTTP $sc)")
+        val st = JSONObject(String(sd, Charsets.UTF_8))
+        if (st.getInt("id") == 0) {
+            status("Фото нет — снимите его на устройстве")
+            return
+        }
+
+        status("Качаю фото с устройства…")
+        val (pcode, photo) = espRequest("/api/photo")
+        if (pcode != 200 || photo.isEmpty())
+            throw IOException("фото недоступно (HTTP $pcode)")
+        log("Фото: ${photo.size / 1024} КБ")
+
+        val question = detectPendingQuestion()
+        if (question.isNotEmpty()) log("→ $question")
+
+        status("ИИ думает…")
+        val answer = callAi(photo, question).trim()
+        log("← $answer")
+
+        val headers = mutableMapOf(
+            "X-Id" to "auto",
+            "Content-Type" to "text/plain; charset=utf-8")
+        if (question.isNotEmpty())
+            headers["X-Question"] = URLEncoder.encode(question, "UTF-8")
+        val (code, _) = espRequest("/api/answer", "POST", headers,
+            answer.take(ANSWER_MAX).toByteArray(Charsets.UTF_8))
+        if (code == 200) status("Готово — ответ на экране устройства")
+        else status("ответ не принят (HTTP $code)")
+    }
+
+    // Последняя «висящая» вопрос-запись (t=2), набранная на телефоне
+    private fun detectPendingQuestion(): String {
+        return try {
+            val (c, d) = espRequest("/api/history")
+            if (c != 200) return ""
+            val arr = JSONArray(String(d, Charsets.UTF_8))
+            if (arr.length() == 0) return ""
+            val last = arr.getJSONObject(arr.length() - 1)
+            if (last.getInt("t") == 2) last.optString("q", "") else ""
+        } catch (_: Exception) {
+            ""
+        }
+    }
+
     private fun quickAsk() {
         btnQuick.isEnabled = false
         exec.execute {
             try {
-                val (sc, sd) = espRequest("/api/state")
-                if (sc != 200) throw IOException("устройство недоступно (HTTP $sc)")
-                val st = JSONObject(String(sd, Charsets.UTF_8))
-                if (st.getInt("id") == 0) {
-                    status("Фото нет — снимите его на устройстве")
-                    return@execute
-                }
-
-                status("Качаю фото с устройства…")
-                val (pcode, photo) = espRequest("/api/photo")
-                if (pcode != 200 || photo.isEmpty())
-                    throw IOException("фото недоступно (HTTP $pcode)")
-                log("Фото: ${photo.size / 1024} КБ")
-
-                status("ИИ думает…")
-                val answer = callAi(photo, "").trim()
-                log("← $answer")
-
-                val (code, _) = espRequest("/api/answer", "POST",
-                    mapOf("X-Id" to "quick",
-                        "Content-Type" to "text/plain; charset=utf-8"),
-                    answer.take(ANSWER_MAX).toByteArray(Charsets.UTF_8))
-                if (code == 200) status("Готово — ответ на экране устройства")
-                else status("ответ не принят (HTTP $code)")
+                runPhotoAsk()
             } catch (e: Exception) {
                 log("ОШИБКА: ${e.message}")
                 status("Ошибка: ${e.message}")

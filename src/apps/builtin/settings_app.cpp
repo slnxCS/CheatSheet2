@@ -55,7 +55,7 @@ static void highlight_items() {
 // Экран выше 240px (4 пункта) — прокрутить выбранный пункт на вид.
 // Вызывается только из навигации (при открытии layout ещё не посчитан).
 static void scroll_to_current() {
-    lv_obj_t* row = row_for_item(current_item + 1);
+    lv_obj_t* row = row_for_item(current_item);
     if (row) lv_obj_scroll_to_view(row, LV_ANIM_ON);
 }
 
@@ -164,7 +164,12 @@ void settings_app_open(lv_obj_t* parent) {
     lv_obj_align(lbl_title, LV_ALIGN_CENTER, 0, 0);
 
     lv_obj_t* section = lv_obj_create(parent);
-    lv_obj_set_size(section, LV_PCT(90), LV_SIZE_CONTENT);
+    // Фиксированная высота под экран + своя прокрутка: 4 пункта не влезают
+    // в 240px — секция листается (scroll_to_view подтягивает выбранный пункт)
+    lv_obj_set_size(section, LV_PCT(90), 240 - 44 - 8);
+    lv_obj_set_scrollbar_mode(section, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_set_scroll_dir(section, LV_DIR_VER);
+    lv_obj_remove_flag(section, LV_OBJ_FLAG_SCROLL_ELASTIC);
     lv_obj_set_style_bg_color(section, theme_color_panel(), 0);
     lv_obj_set_style_bg_opa(section, LV_OPA_60, 0);
     lv_obj_set_style_border_width(section, 0, 0);

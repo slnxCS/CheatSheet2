@@ -33,6 +33,7 @@ static char       answer_buf[ANSWER_MAX];
 static size_t     answer_len = 0;
 static uint32_t   answer_seq = 0;
 static uint32_t   ui_seq = 0;      // любое событие чата → автооткрытия экрана
+static uint32_t   send_seq = 0;    // запрос «Отправить» из чата
 
 // Кольцо истории: без memmove, head — слот следующей записи
 static AiHistEntry hist[AI_HIST_MAX];
@@ -69,6 +70,19 @@ uint32_t ai_link_answer_seq() {
 
 uint32_t ai_link_history_seq() {
     return hist_seq;
+}
+
+bool ai_link_request_send() {
+    bool ok = false;
+    portENTER_CRITICAL(&lk_mux);
+    if (photo_path[0]) { send_seq++; ok = true; }
+    portEXIT_CRITICAL(&lk_mux);
+    if (ok) Serial.printf("ai_link: send requested (#%u)\n", (unsigned)send_seq);
+    return ok;
+}
+
+uint32_t ai_link_send_seq() {
+    return send_seq;
 }
 
 int ai_link_history_count() {
@@ -368,10 +382,10 @@ static void h_state() {
     portEXIT_CRITICAL(&lk_mux);
 
     snprintf(buf, sizeof(buf),
-             "{\"state\":%d,\"id\":%u,\"name\":\"%s\",\"seq\":%u,\"alen\":%u,\"hseq\":%u,\"hcnt\":%d}",
+             "{\"state\":%d,\"id\":%u,\"name\":\"%s\",\"seq\":%u,\"alen\":%u,\"hseq\":%u,\"hcnt\":%d,\"send\":%u}",
              (int)st, (unsigned)id, name,
              (unsigned)answer_seq, (unsigned)alen,
-             (unsigned)hist_seq, hist_cnt);
+             (unsigned)hist_seq, hist_cnt, (unsigned)send_seq);
     server.send(200, "application/json", buf);
 }
 

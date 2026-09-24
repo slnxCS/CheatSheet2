@@ -441,6 +441,53 @@ static bool save_photo(const uint8_t* jpeg_data, size_t jpeg_len, size_t* out_si
     return true;
 }
 
+// --- Снимок из другого приложения (кнопка «Сфоткать» в чате «ИИ») ---
+// Приложение камеры закрыто → камера не инициализирована: поднимаем её на
+// время снимка, гоняем тот же AF и сохраняем тем же save_photo. Блокирует
+// LVGL ~3-7 с; stage_cb между этапами — показать плашку и обновить экран.
+static volatile bool headless_busy = false;
+
+bool camera_app_capture_headless(void (*stage_cb)(int, unsigned)) {
+    if (headless_busy || parent_ref) return false;   // камера занята/открыта
+    headless_busy = true;
+
+    bool ok = false;
+    bool inited_here = false;
+    bool tmp_here = false;
+
+    if (stage_cb) stage_cb(0, 0);
+
+    do {
+        if (!camera_is_ready()) {
+            if (!camera_init()) break;
+            inited_here = true;
+        }
+        if (!temp_buf) {
+            temp_buf = (uint8_t*)ps_malloc(AF_W * AF_H * 2);
+            if (!temp_buf) break;
+            tmp_here = true;
+        }
+
+        if (stage_cb) stage_cb(1, 0);
+        cam_focus = run_autofocus(cam_focus);
+
+        if (stage_cb) stage_cb(2, 0);
+        uint8_t* jb = nullptr;
+        size_t jl = 0;
+        if (!camera_capture(&jb, &jl)) break;
+
+        size_t saved = 0;
+        ok = save_photo(jb, jl, &saved);   // внутри ставит фото в очередь ИИ
+        camera_release();
+        if (ok && stage_cb) stage_cb(3, (unsigned)(saved / 1024));
+    } while (0);
+
+    if (tmp_here && temp_buf) { free(temp_buf); temp_buf = nullptr; }
+    if (inited_here) camera_deinit();
+    headless_busy = false;
+    return ok;
+}
+
 void camera_app_open(lv_obj_t* parent) {
     parent_ref = parent;
     preview_active = false;

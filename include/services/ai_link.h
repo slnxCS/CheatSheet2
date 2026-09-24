@@ -40,3 +40,8 @@ uint32_t ai_link_answer_seq();             // № ответа (для авто�
 uint32_t ai_link_history_seq();            // растёт на каждое событие чата
 int  ai_link_history_count();
 bool ai_link_history_get(int idx, AiHistEntry* out);  // копия одной записи
+
+// «Отправить» в чате: телефон при опросе /api/state увидит рост send_seq
+// и сам заберёт фото → ИИ → ответ. false = фото ещё не снималось.
+bool ai_link_request_send();
+uint32_t ai_link_send_seq();

@@ -37,6 +37,10 @@ struct LangStrings {
     const char* ai_pending;
     const char* ai_taken;
     const char* ai_answered;
+    const char* ai_take_photo;
+    const char* ai_send;
+    const char* ai_no_photo;
+    const char* ai_waiting;
 };
 
 static const LangStrings lang_en = {
@@ -68,10 +72,14 @@ static const LangStrings lang_en = {
     .explorer_select = "select",
     .explorer_back   = "back",
     .explorer_open   = "open",
-    .ai_nothing  = "No photo. Take a photo in the camera.",
+    .ai_nothing  = "No photo yet. Press \"Take photo\".",
     .ai_pending  = "Photo taken. Open the app on your phone.",
     .ai_taken    = "Sent to AI - waiting for the answer...",
     .ai_answered = "Answer received",
+    .ai_take_photo = "Take photo",
+    .ai_send       = "Send",
+    .ai_no_photo   = "No photo - take one first",
+    .ai_waiting    = "Waiting for the phone...",
 };
 
 static const LangStrings lang_ru = {
@@ -103,10 +111,14 @@ static const LangStrings lang_ru = {
     .explorer_select = "выбор",
     .explorer_back   = "назад",
     .explorer_open   = "открыть",
-    .ai_nothing  = "Нет фото. Снимите фото в камере.",
+    .ai_nothing  = "Нет фото. Нажмите «Сфоткать».",
     .ai_pending  = "Фото снято. Откройте приложение на телефоне.",
     .ai_taken    = "Отправлено в ИИ - жду ответ...",
     .ai_answered = "Ответ получен",
+    .ai_take_photo = "Сфоткать",
+    .ai_send       = "Отправить",
+    .ai_no_photo   = "Нет фото - сначала сфоткать",
+    .ai_waiting    = "Ждём телефон...",
 };
 
 static const LangStrings* langs[LANG_COUNT] = {
@@ -158,6 +170,10 @@ const char* lang_str_camera_mode_fit() { return langs[current_lang]->camera_mode
 const char* lang_str_app_explorer()   { return langs[current_lang]->app_explorer; }
 const char* lang_str_app_ai()         { return langs[current_lang]->app_ai; }
 const char* lang_str_ai_you()         { return langs[current_lang]->ai_you; }
+const char* lang_str_ai_take_photo()  { return langs[current_lang]->ai_take_photo; }
+const char* lang_str_ai_send()        { return langs[current_lang]->ai_send; }
+const char* lang_str_ai_no_photo()    { return langs[current_lang]->ai_no_photo; }
+const char* lang_str_ai_waiting()     { return langs[current_lang]->ai_waiting; }
 const char* lang_str_settings_wifi()  { return langs[current_lang]->settings_wifi; }
 const char* lang_str_ai_nothing()     { return langs[current_lang]->ai_nothing; }
 const char* lang_str_ai_pending()     { return langs[current_lang]->ai_pending; }
