@@ -5,23 +5,17 @@ import android.app.AlertDialog
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.net.ConnectivityManager
-import android.net.Network
-import android.net.NetworkCapabilities
-import android.net.NetworkRequest
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.provider.OpenableColumns
 import android.provider.Settings
 import android.provider.MediaStore
 import android.text.InputType
-import android.util.Base64
 import android.util.TypedValue
 import android.view.View
 import android.widget.Button
@@ -33,80 +27,10 @@ import android.widget.ArrayAdapter
 import android.widget.ListView
 import android.widget.TextView
 import org.json.JSONArray
-import org.json.JSONObject
-import java.io.ByteArrayOutputStream
 import java.io.IOException
-import java.net.HttpURLConnection
-import java.net.URL
 import java.net.URLEncoder
 import java.util.concurrent.Executors
-import java.util.TimeZone
 import kotlin.concurrent.thread
-
-// ---------- Общая связь с устройством (общи для MainActivity и FileActivity) ----------
-
-private const val ESP_IP = "192.168.4.1"
-
-// Handle сети ESP от WifiNetworkSpecifier — живёт, пока открыто приложение
-@Volatile private var espNetwork: Network? = null
-
-// Момент последнего УСПЕШНОГО запроса — «линк работал» (для шторм-капа EPERM)
-@Volatile private var lastReqOkAt = 0L
-
-// MainActivity подключает сюда сброс (invalidateEsp) при смерти линка
-private var espDeadHandler: ((String) -> Unit)? = null
-
-// HTTP к устройству: сокет принудительно привязан к сети ESP, иначе трафик
-// уйдёт в мобильный интернет и 192.168.4.1 будет недоступен.
-private fun espRequest(path: String, method: String = "GET",
-                       headers: Map<String, String>? = null,
-                       body: ByteArray? = null): Pair<Int, ByteArray> {
-    val net = espNetwork ?: throw IOException("нет связи с устройством")
-    val url = URL("http://$ESP_IP$path")
-    try {
-        // Network.openConnection — трафик идёт только по сети ESP
-        val conn = net.openConnection(url) as HttpURLConnection
-        conn.apply {
-            connectTimeout = 5_000
-            readTimeout = if (path.startsWith("/api/photo") || path.startsWith("/api/file"))
-                30_000 else 8_000
-            requestMethod = method
-            headers?.forEach { (k, v) -> setRequestProperty(k, v) }
-            // Часы устройства: NTP у ESP нет (он не в интернете) —
-            // присылаем своё время и свою часовую зону на каждом запросе
-            setRequestProperty("X-Time", (System.currentTimeMillis() / 1000).toString())
-            setRequestProperty("X-Tz",
-                (TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 1000).toString())
-            if (body != null) {
-                doOutput = true
-                outputStream.use { it.write(body) }
-            }
-        }
-        val code = conn.responseCode
-        val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-        val data = stream?.use { inp ->
-            val out = ByteArrayOutputStream()
-            val buf = ByteArray(16 * 1024)
-            while (true) {
-                val n = inp.read(buf)
-                if (n < 0) break
-                out.write(buf, 0, n)
-            }
-            out.toByteArray()
-        } ?: ByteArray(0)
-        conn.disconnect()
-        lastReqOkAt = System.currentTimeMillis()
-        return code to data
-    } catch (e: IOException) {
-        val m = e.message.orEmpty()
-        if (m.contains("Binding socket") || m.contains("EPERM") ||
-            m.contains("ENONET") || m.contains("unreachable")) {
-            espDeadHandler?.invoke(e.message ?: "сеть недействительна")
-            throw IOException("сеть устройства пропала — переподключаюсь…")
-        }
-        throw e
-    }
-}
 
 /*
  * CamLink — посредник «телефон ⇄ устройство CheatSheet2 ⇄ ИИ».
@@ -119,18 +43,14 @@ private fun espRequest(path: String, method: String = "GET",
  *
  * Подключение: WifiNetworkSpecifier (Android 10+) — локальная сеть к SoftAP
  * «CSCAM», мобильный интернет остаётся для API ИИ.
+ *
+ * Вся рабочая логика (сеть, опрос /api/state, вызовы ИИ) живёт в
+ * BridgeService — foreground-сервисе, который переживает уход приложения
+ * в фон и погашение экрана. Activity здесь только рисует и подписывается
+ * на журнал через BridgeBus.
  */
 class MainActivity : Activity() {
 
-    private companion object {
-        const val ANSWER_MAX = 3800           // буфер ответа на устройстве — 4096
-        const val DEFAULT_PROMPT =
-            "Ты помогаешь на контрольной. Распознай вопрос на фото и дай краткий " +
-            "правильный ответ: если тест с вариантами — укажи букву и одно предложение " +
-            "почему; если развёрнутый вопрос — 2-3 предложения. Отвечай только по делу."
-    }
-
-    private lateinit var cm: ConnectivityManager
     private lateinit var tvStatus: TextView
     private lateinit var tvLog: TextView
     private lateinit var etInput: EditText
@@ -139,45 +59,76 @@ class MainActivity : Activity() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val exec = Executors.newSingleThreadExecutor()
 
-    private var netCallback: ConnectivityManager.NetworkCallback? = null
-    @Volatile private var pendingPhoto: ByteArray? = null
-    private var lastSendSeen = 0L        // последний seen send с устройства
-    private var reconnectPending = false  // запланировано авто-переподключение
-    private var bindFails = 0             // окно счётчика EPERM (шторм = ребуты ESP)
-    private var bindFailsWin = 0L
-    @Volatile private var lastAvailableAt = 0L       // время onAvailable, мс
-    @Volatile private var lostSeenSinceAvail = false // был ли onLost после него
-
     private val prefs by lazy { getSharedPreferences("camlink", Context.MODE_PRIVATE) }
-
-    // Устройство может само попросить отправить фото (кнопка «Отправить»
-    // в чате «ИИ») — опрашиваем /api/state и подхватываем.
-    private val pollRunnable = object : Runnable {
-        override fun run() {
-            if (espNetwork != null) {
-                exec.execute { pollSend() }
-            }
-            mainHandler.postDelayed(this, 2000)
-        }
-    }
 
     // ---------- Жизненный цикл ----------
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        espDeadHandler = { invalidateEsp(it) }
         buildUi()
-        connectEsp()
-        mainHandler.postDelayed(pollRunnable, 2000)
+        attachBus()
+        maybePromptWifi()
+        maybeAskBattery()
+        startForegroundService(Intent(this, BridgeService::class.java))
+        // Если прошлый старт сервиса не смог показать системный диалог
+        // подключения (приложение было в фоне) — повторяем, пока мы на виду.
+        BridgeService.instance?.ensureConnected()
     }
 
     override fun onDestroy() {
-        mainHandler.removeCallbacks(pollRunnable)
-        netCallback?.let { cm.unregisterNetworkCallback(it) }
-        netCallback = null
-        espDeadHandler = null
+        BridgeBus.onLog = null
+        BridgeBus.onStatus = null
+        BridgeBus.onLink = null
+        BridgeBus.onSendDone = null
+        BridgeBus.onAskDone = null
         exec.shutdownNow()
         super.onDestroy()
+    }
+
+    // Подписка на журнал моста: реплей истории + живые обновления
+    private fun attachBus() {
+        BridgeBus.onLog = { line -> mainHandler.post { appendLog(line) } }
+        BridgeBus.onStatus = { s -> mainHandler.post { tvStatus.text = s } }
+        BridgeBus.onLink = { linked -> mainHandler.post { btnQuick.isEnabled = linked } }
+        BridgeBus.onSendDone = { mainHandler.post { btnSend.isEnabled = true } }
+        BridgeBus.onAskDone = { mainHandler.post { btnQuick.isEnabled = BridgeBus.linked } }
+        BridgeBus.replay().forEach { appendLog(it) }
+        if (BridgeBus.lastStatus.isNotEmpty()) tvStatus.text = BridgeBus.lastStatus
+        btnQuick.isEnabled = BridgeBus.linked
+    }
+
+    private fun appendLog(msg: String) {
+        tvLog.append(msg + "\n")
+        (tvLog.parent as? ScrollView)?.post {
+            (tvLog.parent as ScrollView).fullScroll(View.FOCUS_DOWN)
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun maybePromptWifi() {
+        val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        if (!wifi.isWifiEnabled) {
+            status("WiFi выключен — включаю настройки")
+            try { startActivity(Intent(Settings.ACTION_WIFI_SETTINGS)) } catch (_: Exception) {}
+            log("! Включите WiFi и вернитесь в приложение (кнопка ↻)")
+        }
+    }
+
+    // Android режет сеть фоновым приложениям (Doze) — просим исключение,
+    // иначе с выключенным экраном связь с устройством будет обрываться.
+    private fun maybeAskBattery() {
+        if (prefs.getBoolean("battAsked", false)) return
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        if (pm.isIgnoringBatteryOptimizations(packageName)) return
+        prefs.edit().putBoolean("battAsked", true).apply()
+        log("! Разрешите CamLink работать без ограничений батареи —")
+        log("  иначе Android усыпит связь в фоне (экран погас)")
+        try {
+            startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                Uri.parse("package:$packageName")))
+        } catch (e: Exception) {
+            log("  не удалось: ${e.message} — вручную: Настройки → Батарея → Исключения")
+        }
     }
 
     // ---------- Интерфейс (программный, без XML) ----------
@@ -253,7 +204,7 @@ class MainActivity : Activity() {
             LinearLayout.LayoutParams.WRAP_CONTENT, 0f))
         actionRow.addView(Button(this).apply {
             text = "↻"
-            setOnClickListener { reconnectEsp() }
+            setOnClickListener { BridgeService.reconnect() }
         }, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT,
             LinearLayout.LayoutParams.WRAP_CONTENT, 0f))
         root.addView(actionRow, LinearLayout.LayoutParams(
@@ -273,185 +224,11 @@ class MainActivity : Activity() {
         setContentView(root)
     }
 
-    private fun log(msg: String) {
-        mainHandler.post {
-            tvLog.append(msg + "\n")
-            (tvLog.parent as? ScrollView)?.post {
-                (tvLog.parent as ScrollView).fullScroll(View.FOCUS_DOWN)
-            }
-        }
-    }
+    private fun log(msg: String) = BridgeBus.log(msg)
 
-    private fun status(msg: String) {
-        mainHandler.post { tvStatus.text = msg }
-    }
+    private fun status(msg: String) = BridgeBus.status(msg)
 
-    // ---------- Подключение к SoftAP устройства ----------
-
-    @Suppress("DEPRECATION")
-    private fun connectEsp() {
-        if (netCallback != null) return
-        cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-
-        val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-        if (!wifi.isWifiEnabled) {
-            status("WiFi выключен — включаю настройки")
-            startActivity(Intent(Settings.ACTION_WIFI_SETTINGS))
-            log("! Включите WiFi и вернитесь в приложение (кнопка ↻)")
-        }
-
-        val ssid = prefs.getString("ssid", "CSCAM")!!
-        val pass = prefs.getString("pass", "cscam1234")!!
-        log("Запрос подключения к «$ssid» (системный диалог — «Подключиться»)…")
-        if (vpnActive())
-            log("! Активен VPN — он может запрещать привязку сокета к устройству (EPERM)")
-
-        val specifier = try {
-            android.net.wifi.WifiNetworkSpecifier.Builder()
-                .setSsid(ssid)
-                .setWpa2Passphrase(pass)
-                .build()
-        } catch (e: IllegalArgumentException) {
-            status("Проверьте пароль в Настройках")
-            log("Ошибка сети: ${e.message}")
-            return
-        }
-
-        val request = NetworkRequest.Builder()
-            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
-            .setNetworkSpecifier(specifier)
-            .build()
-
-        val cb = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) {
-                espNetwork = network
-                lastAvailableAt = System.currentTimeMillis()
-                lostSeenSinceAvail = false
-                log("✔ Подключено к устройству ($ssid) [сеть $network]")
-                status("Подключено — чат на устройстве")
-                mainHandler.post { btnQuick.isEnabled = true }
-            }
-
-            override fun onLost(network: Network) {
-                lostSeenSinceAvail = true
-                val since = if (lastAvailableAt > 0)
-                    "${System.currentTimeMillis() - lastAvailableAt} мс после подключения"
-                else "вне подключения"
-                if (espNetwork == network) espNetwork = null
-                log("✖ onLost [сеть $network] — $since")
-                status("Нет связи — жду переподключения…")
-                mainHandler.post { btnQuick.isEnabled = false }
-                scheduleAutoReconnect()
-            }
-
-            override fun onUnavailable() {
-                status("Не удалось подключиться — нажмите ↻")
-                log("✖ Диалог подключения не подтверждён")
-            }
-        }
-        netCallback = cb
-        try {
-            // Без таймаута: запрос держится, пока открыто приложение
-            // (сохранился сомнительный 30 с — мог рвать связь)
-            cm.requestNetwork(request, cb)
-        } catch (e: SecurityException) {
-            // старые сборки падали тут — нет CHANGE_NETWORK_STATE
-            status("Нет разрешения сети: ${e.message}")
-            log("requestNetwork: ${e.message}")
-            netCallback = null
-            return
-        }
-        status("Подключение к устройству…")
-        // Подсказка, если системный диалог подключения не подтвердили
-        mainHandler.postDelayed({
-            if (espNetwork == null && netCallback == cb) {
-                status("Не подключено — нажмите ↻")
-                log("! Системный диалог подключения не подтверждён")
-            }
-        }, 45_000)
-    }
-
-    private fun reconnectEsp() {
-        netCallback?.let {
-            cm.unregisterNetworkCallback(it)
-            netCallback = null
-        }
-        espNetwork = null
-        connectEsp()
-    }
-
-    // Сеть выпала (перезагрузка устройства, уход с WiFi): перевыполнить
-    // запрос через 15 с — если onAvailable не придёт сам, зарегистрируем
-    // новый. Один флаг — без шквала повторов.
-    private fun scheduleAutoReconnect() {
-        mainHandler.post {
-            if (reconnectPending) return@post
-            reconnectPending = true
-            mainHandler.postDelayed({
-                reconnectPending = false
-                if (espNetwork == null) {
-                    log("↻ Авто-переподключение…")
-                    reconnectEsp()
-                }
-            }, 15_000)
-        }
-    }
-
-    // Сеть умерла между выбором и привязкой сокета
-    // («Binding socket to network N failed: EPERM/ENONET») — сбросить
-    // старую ссылку и дать цепочке восстановиться
-    private fun invalidateEsp(reason: String) {
-        mainHandler.post {
-            // Диагностика: если onLost НЕ был — линк формально жив, а
-            // привязку запрещает система (VPN/файрвол/OEM). Если был —
-            // сеть реально упала сразу после выдачи handle.
-            val since = if (lastAvailableAt > 0)
-                "onAvailable был ${System.currentTimeMillis() - lastAvailableAt} мс назад"
-            else "onAvailable не было"
-            val lost = if (lostSeenSinceAvail) "onLost: был" else "onLost: НЕ был"
-            log("! Связь прервана: $reason")
-            log("  └ $since; $lost")
-            espNetwork = null
-            btnQuick.isEnabled = false
-
-            // VPN — известная системная причина EPERM: запрещает привязку
-            // сокета к локальной сети. Переподключение тут не поможет —
-            // не крутим шторм.
-            if (vpnActive()) {
-                log("! На телефоне активен VPN — он блокирует связь с устройством (EPERM).")
-                log("  Отключите VPN или добавьте CamLink в его исключения/обход.")
-                status("EPERM — мешает VPN (см. лог)")
-                return@post
-            }
-
-            // Шторм-кап: линк НЕ работал 2 минуты и 4 ошибки подряд —
-            // авто-переподключение не лечит причину, остановиться.
-            val now = System.currentTimeMillis()
-            if (now - lastReqOkAt < 60_000) bindFails = 0      // линк работал недавно = реальные обрывы
-            if (now - bindFailsWin > 120_000) { bindFailsWin = now; bindFails = 0 }
-            bindFails++
-            if (bindFails >= 4) {
-                log("! Авто-переподключение остановлено ($bindFails подряд за 2 мин).")
-                log("  Причина на стороне телефона/линка — переподключение не лечит.")
-                log("  Нажмите ↻ после устранения причины.")
-                status("Переподключение остановлено — нажмите ↻")
-                return@post
-            }
-            if (bindFails == 3)
-                log("! Частые обрывы — если устройство не перезагружается, " +
-                    "проверьте питание: 5.0V под нагрузкой, ≥2A, " +
-                    "конденсатор 470–1000µF.")
-            status("Переподключение к устройству…")
-            scheduleAutoReconnect()
-        }
-    }
-
-    private fun vpnActive(): Boolean {
-        val caps = cm.activeNetwork?.let { cm.getNetworkCapabilities(it) }
-        return caps?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
-    }
-
-    // ---------- Отправка ----------
+    // ---------- Отправка (работа выполняется в BridgeService) ----------
 
     // Текст (± фото) → вопрос сразу на устройство → ИИ → ответ на устройство
     private fun send() {
@@ -459,134 +236,18 @@ class MainActivity : Activity() {
         val photo = pendingPhoto
         if (text.isEmpty() && photo == null) return
         etInput.setText("")
-        if (text.isNotEmpty()) log("вопрос: ${text.length} симв → устройство")
-
         btnSend.isEnabled = false
-        val headers = mutableMapOf("X-Id" to "chat")
-        if (text.isNotEmpty())
-            headers["X-Question"] = URLEncoder.encode(text, "UTF-8")
-
-        // 1) вопрос мгновенно в чат устройства (пузырь «…»)
-        if (text.isNotEmpty()) {
-            exec.execute {
-                try {
-                    val (code, _) = espRequest("/api/question", "POST",
-                        mapOf("X-Question" to headers["X-Question"]!!), ByteArray(0))
-                    if (code != 200) log("устройство: вопрос не принят (HTTP $code)")
-                } catch (e: Exception) {
-                    log("вопрос не доставлен: ${e.message}")
-                }
-            }
-        }
-
-        // 2) ИИ через мобильный интернет, 3) ответ обратно
-        exec.execute {
-            try {
-                status("ИИ думает…")
-                val answer = callAi(photo, text).trim()
-                log("ответ ИИ: ${answer.length} симв")
-                pendingPhoto = null
-
-                // ответ (с дублем вопроса — если шаг 1 не прошл, он станет новым обменом)
-                val (code, _) = espRequest("/api/answer", "POST",
-                    headers + ("Content-Type" to "text/plain; charset=utf-8"),
-                    answer.take(ANSWER_MAX).toByteArray(Charsets.UTF_8))
-                if (code == 200) status("Готово — ответ на экране устройства")
-                else { log("устройство: ответ не принят (HTTP $code)"); status("ИИ ответил, устройство недоступно") }
-            } catch (e: Exception) {
-                log("ОШИБКА: ${e.message}")
-                status("Ошибка: ${e.message}")
-                // сорванный вопрос не должен остаться «…» навсегда
-                try {
-                    if (text.isNotEmpty())
-                        espRequest("/api/answer", "POST",
-                            headers + ("Content-Type" to "text/plain; charset=utf-8"),
-                            "⚠ ${e.message}".toByteArray(Charsets.UTF_8))
-                } catch (_: Exception) {}
-            } finally {
-                mainHandler.post { btnSend.isEnabled = true }
-            }
-        }
-    }
-
-    // «Отправить» на устройстве → телефон сам: фото → вопрос → ИИ → ответ
-    private fun pollSend() {
-        try {
-            val (c, d) = espRequest("/api/state")
-            if (c != 200) return
-            val send = JSONObject(String(d, Charsets.UTF_8)).optLong("send", 0)
-            if (send > lastSendSeen) {
-                if (exec.isShutdown) return
-                lastSendSeen = send
-                log("Устройство просит отправить фото (#$send)")
-                runPhotoAsk()
-            }
-        } catch (_: Exception) {
-            // связи нет — просто ждём следующего опроса
-        }
-    }
-
-    // Общий сценарий «фото с устройства → ИИ → ответ»: и для кнопки «📷»,
-    // и для запроса «Отправить» с устройства. Вопрос берётся из последней
-    // «висящей» записи чата (пользователь мог набрать его на телефоне).
-    private fun runPhotoAsk() {
-        val (sc, sd) = espRequest("/api/state")
-        if (sc != 200) throw IOException("устройство недоступно (HTTP $sc)")
-        val st = JSONObject(String(sd, Charsets.UTF_8))
-        if (st.getInt("id") == 0) {
-            status("Фото нет — снимите его на устройстве")
-            return
-        }
-
-        status("Качаю фото с устройства…")
-        val (pcode, photo) = espRequest("/api/photo")
-        if (pcode != 200 || photo.isEmpty())
-            throw IOException("фото недоступно (HTTP $pcode)")
-        log("Фото: ${photo.size / 1024} КБ")
-
-        val question = detectPendingQuestion()
-        if (question.isNotEmpty()) log("вопрос с устройства: ${question.length} симв")
-
-        status("ИИ думает…")
-        val answer = callAi(photo, question).trim()
-        log("ответ ИИ: ${answer.length} симв")
-
-        val headers = mutableMapOf(
-            "X-Id" to "auto",
-            "Content-Type" to "text/plain; charset=utf-8")
-        if (question.isNotEmpty())
-            headers["X-Question"] = URLEncoder.encode(question, "UTF-8")
-        val (code, _) = espRequest("/api/answer", "POST", headers,
-            answer.take(ANSWER_MAX).toByteArray(Charsets.UTF_8))
-        if (code == 200) status("Готово — ответ на экране устройства")
-        else status("ответ не принят (HTTP $code)")
-    }
-
-    // Последняя «висящая» вопрос-запись (t=2), набранная на телефоне
-    private fun detectPendingQuestion(): String {
-        return try {
-            val (c, d) = espRequest("/api/history")
-            if (c != 200) return ""
-            val arr = JSONArray(String(d, Charsets.UTF_8))
-            if (arr.length() == 0) return ""
-            val last = arr.getJSONObject(arr.length() - 1)
-            if (last.getInt("t") == 2) last.optString("q", "") else ""
-        } catch (_: Exception) {
-            ""
+        if (!BridgeService.submitQuestion(text, photo)) {
+            log("! Мост ещё не запущен — попробуйте через секунду")
+            btnSend.isEnabled = true
         }
     }
 
     private fun quickAsk() {
         btnQuick.isEnabled = false
-        exec.execute {
-            try {
-                runPhotoAsk()
-            } catch (e: Exception) {
-                log("ОШИБКА: ${e.message}")
-                status("Ошибка: ${e.message}")
-            } finally {
-                mainHandler.post { btnQuick.isEnabled = espNetwork != null }
-            }
+        if (!BridgeService.photoAsk()) {
+            log("! Мост ещё не запущен — попробуйте через секунду")
+            btnQuick.isEnabled = BridgeBus.linked
         }
     }
 
@@ -641,139 +302,6 @@ class MainActivity : Activity() {
         }.start()
     }
 
-    // ---------- Изображение ----------
-
-    private fun resize(jpeg: ByteArray, maxSide: Int, quality: Int): ByteArray {
-        val bmp = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size) ?: return jpeg
-        val scale = maxSide.toFloat() / maxOf(bmp.width, bmp.height)
-        val out = if (scale < 1f) {
-            Bitmap.createScaledBitmap(bmp,
-                (bmp.width * scale).toInt().coerceAtLeast(1),
-                (bmp.height * scale).toInt().coerceAtLeast(1), true)
-        } else bmp
-        val bos = ByteArrayOutputStream()
-        out.compress(Bitmap.CompressFormat.JPEG, quality, bos)
-        if (out !== bmp) out.recycle()
-        bmp.recycle()
-        return bos.toByteArray()
-    }
-
-    // ---------- Вызов API ИИ (через мобильный интернет) ----------
-
-    private fun callAi(photo: ByteArray?, userText: String): String {
-        val key = prefs.getString("key", "")!!
-        if (key.isBlank()) throw IOException("нет API-ключа (⚙ Настройки)")
-        val provider = prefs.getString("provider", "gemini")!!
-        val model = prefs.getString("model", "")!!.ifBlank {
-            when (provider) {
-                "openai"     -> "gpt-4o-mini"
-                "openrouter" -> "qwen/qwen3.8-27b:free"   // бесплатная, с картинками
-                else         -> "gemini-3.6-flash"        // бесплатный тариф AI Studio
-            }
-        }
-
-        val openAiUrl =
-            if (provider == "openrouter") "https://openrouter.ai/api/v1/chat/completions"
-            else "https://api.openai.com/v1/chat/completions"
-
-        if (photo == null) {   // текстовый вопрос
-            return if (provider == "gemini") geminiText(key, userText, model)
-                   else openAiText(key, userText, openAiUrl, model)
-        }
-
-        // Фото: промпт-инструкция (+ вопрос пользователя, если был набран)
-        val prompt = prefs.getString("prompt", DEFAULT_PROMPT)!!
-        val visionPrompt =
-            if (userText.isEmpty()) prompt else "$prompt\n\nВопрос: $userText"
-        val resized = resize(photo, 1568, 85)
-        val b64 = Base64.encodeToString(resized, Base64.NO_WRAP)
-        return if (provider == "gemini") callGemini(key, visionPrompt, b64, model)
-               else callOpenAi(key, visionPrompt, b64, openAiUrl, model)
-    }
-
-    private fun postJson(urlStr: String, json: JSONObject,
-                         headers: Map<String, String> = emptyMap()): JSONObject {
-        val conn = URL(urlStr).openConnection() as HttpURLConnection
-        conn.apply {
-            requestMethod = "POST"
-            connectTimeout = 10_000
-            readTimeout = 60_000
-            setRequestProperty("Content-Type", "application/json; charset=utf-8")
-            headers.forEach { (k, v) -> setRequestProperty(k, v) }
-            doOutput = true
-            outputStream.use { it.write(json.toString().toByteArray(Charsets.UTF_8)) }
-        }
-        val code = conn.responseCode
-        val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-        val text = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
-        conn.disconnect()
-        if (code !in 200..299) {
-            val msg = try {
-                JSONObject(text).optJSONObject("error")?.optString("message") ?: text.take(200)
-            } catch (_: Exception) { text.take(200) }
-            throw IOException("API HTTP $code: $msg")
-        }
-        return JSONObject(text)
-    }
-
-    private fun openAiText(key: String, text: String,
-                           url: String, model: String): String {
-        val body = JSONObject()
-            .put("model", model)
-            .put("max_tokens", 1200)
-            .put("messages", JSONArray().put(
-                JSONObject().put("role", "user").put("content", text)))
-        val resp = postJson(url, body,
-            mapOf("Authorization" to "Bearer $key"))
-        return resp.getJSONArray("choices")
-            .getJSONObject(0).getJSONObject("message").getString("content")
-    }
-
-    private fun geminiText(key: String, text: String, model: String): String {
-        val body = JSONObject().put("contents", JSONArray().put(
-            JSONObject().put("role", "user")
-                .put("parts", JSONArray().put(JSONObject().put("text", text)))))
-        val resp = postJson(
-            "https://generativelanguage.googleapis.com/v1beta/models/" +
-            "$model:generateContent?key=$key", body)
-        val cand = resp.getJSONArray("candidates").getJSONObject(0)
-        return cand.getJSONObject("content").getJSONArray("parts")
-            .getJSONObject(0).getString("text")
-    }
-
-    private fun callOpenAi(key: String, prompt: String, b64: String,
-                          url: String, model: String): String {
-        val content = JSONArray()
-            .put(JSONObject().put("type", "text").put("text", prompt))
-            .put(JSONObject().put("type", "image_url")
-                .put("image_url", JSONObject().put("url", "data:image/jpeg;base64,$b64")))
-        val body = JSONObject()
-            .put("model", model)
-            .put("max_tokens", 1200)
-            .put("messages", JSONArray().put(
-                JSONObject().put("role", "user").put("content", content)))
-        val resp = postJson(url, body,
-            mapOf("Authorization" to "Bearer $key"))
-        return resp.getJSONArray("choices")
-            .getJSONObject(0).getJSONObject("message").getString("content")
-    }
-
-    private fun callGemini(key: String, prompt: String, b64: String,
-                           model: String): String {
-        val parts = JSONArray()
-            .put(JSONObject().put("text", prompt))
-            .put(JSONObject().put("inline_data",
-                JSONObject().put("mime_type", "image/jpeg").put("data", b64)))
-        val body = JSONObject().put("contents", JSONArray().put(
-            JSONObject().put("role", "user").put("parts", parts)))
-        val resp = postJson(
-            "https://generativelanguage.googleapis.com/v1beta/models/" +
-            "$model:generateContent?key=$key", body)
-        val cand = resp.getJSONArray("candidates").getJSONObject(0)
-        return cand.getJSONObject("content").getJSONArray("parts")
-            .getJSONObject(0).getString("text")
-    }
-
     // ---------- Настройки ----------
 
     private fun openSettings() {
@@ -809,10 +337,20 @@ class MainActivity : Activity() {
         })
         val modelEdit = EditText(this).apply {
             hint = "пусто = по умолчанию (gemini-3.6-flash / " +
-                   "gpt-4o-mini / qwen3.8-27b:free)"
+                   "gpt-4o-mini / openrouter/free)"
             setText(prefs.getString("model", ""))
         }
         layout.addView(modelEdit)
+
+        layout.addView(TextView(this).apply {
+            text = "Прокси для ИИ (порт Happ при активном VPN)"
+            setPadding(0, dp(12), 0, 0)
+        })
+        val proxyEdit = EditText(this).apply {
+            hint = "127.0.0.1:10809 или socks5://127.0.0.1:10808 — пусто = напрямую"
+            setText(prefs.getString("ai_proxy", ""))
+        }
+        layout.addView(proxyEdit)
 
         layout.addView(TextView(this).apply {
             text = "Промпт (для фото)"
@@ -855,6 +393,7 @@ class MainActivity : Activity() {
                     })
                     .putString("key", keyEdit.text.toString().trim())
                     .putString("model", modelEdit.text.toString().trim())
+                    .putString("ai_proxy", proxyEdit.text.toString().trim())
                     .putString("prompt", promptEdit.text.toString().trim())
                     .putString("ssid", ssidEdit.text.toString().trim())
                     .putString("pass", passEdit.text.toString().trim())
