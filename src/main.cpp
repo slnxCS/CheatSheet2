@@ -19,6 +19,7 @@
 #include "services/storage_service.h"
 #include "services/battery_service.h"
 #include "services/wifi_service.h"
+#include "services/time_service.h"
 #include "services/ai_link.h"
 #include "ui/app_host.h"
 #include "ui/theme.h"
@@ -185,6 +186,7 @@ void setup() {
     Serial.println("[6/6] Boot complete!");
 
     init_fs();
+    time_service_boot_restore();   // /clock → время переживает ребут
 
     // WiFi SoftAP («CSCAM») + HTTP-мост «устройство → телефон → ИИ».
     // Порядок важен: сначала WiFi (init может ничего не запустить, если

@@ -5,11 +5,11 @@
 #include "drivers/input.h"
 #include "services/lang_service.h"
 #include "services/ai_link.h"
+#include "services/time_service.h"
 #include "services/storage_service.h"
 #include "ui/theme.h"
 #include <Arduino.h>
 #include <JPEGENC.h>
-#include <time.h>
 #include <FS.h>
 #include <LittleFS.h>
 #include <SD_MMC.h>
@@ -424,12 +424,12 @@ static bool save_photo(const uint8_t* jpeg_data, size_t jpeg_len, size_t* out_si
         return false;
     }
 
-    time_t now = time(nullptr);
-    struct tm* t = localtime(&now);
+    // Имя файла от часов (время присылает телефон); без localtime() —
+    // он падал в newlib-замке, см. time_service.h
+    char ts[16];
     char path[64];
-    snprintf(path, sizeof(path), "/images/%04d%02d%02d_%02d%02d%02d.jpg",
-             t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
-             t->tm_hour, t->tm_min, t->tm_sec);
+    time_ymdhms(ts, sizeof(ts));
+    snprintf(path, sizeof(path), "/images/%s.jpg", ts);
 
     File f = fs->open(path, FILE_WRITE);
     if (!f) { free(tbuf); return false; }

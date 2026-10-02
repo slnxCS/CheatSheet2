@@ -40,6 +40,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import java.util.concurrent.Executors
+import java.util.TimeZone
 import kotlin.concurrent.thread
 
 // ---------- Общая связь с устройством (общи для MainActivity и FileActivity) ----------
@@ -71,6 +72,11 @@ private fun espRequest(path: String, method: String = "GET",
                 30_000 else 8_000
             requestMethod = method
             headers?.forEach { (k, v) -> setRequestProperty(k, v) }
+            // Часы устройства: NTP у ESP нет (он не в интернете) —
+            // присылаем своё время и свою часовую зону на каждом запросе
+            setRequestProperty("X-Time", (System.currentTimeMillis() / 1000).toString())
+            setRequestProperty("X-Tz",
+                (TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 1000).toString())
             if (body != null) {
                 doOutput = true
                 outputStream.use { it.write(body) }

@@ -1,5 +1,6 @@
 #include "services/ai_link.h"
 #include "services/lang_service.h"
+#include "services/time_service.h"
 #include "services/wifi_service.h"
 #include "ui/ui_manager.h"
 #include "ui/app_host.h"
@@ -11,6 +12,7 @@
 #include <freertos/semphr.h>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 
 // Данные общие: пишутся из LVGL-потока (событие фото) и HTTP-задачи
@@ -148,12 +150,6 @@ static void utf8_cut(char* s, size_t max) {
     s[n] = '\0';
 }
 
-static void now_hm(char* out, size_t max) {
-    time_t t = time(nullptr);
-    struct tm* lt = localtime(&t);
-    snprintf(out, max, "%02d:%02d", lt->tm_hour, lt->tm_min);
-}
-
 // Файл: строки вида "T\x1fHH:MM\x1fq\x1fa\n" (экранировано)
 static void persist_append(int phys) {
     if (!hist_file_sem) return;
@@ -183,11 +179,18 @@ static void persist_append(int phys) {
 
 // Добавить событие в чат (type: 0=фото, 1=вопрос+ответ)
 static void hist_add(uint8_t type, const char* q, const char* a) {
+    // Время считаем ДО критической секции: localtime() берёт newlib-замок,
+    // а внутри portENTER_CRITICAL (прерывания замаскированы) newlib считает
+    // себя в прерывании и abort() — «recursive mutex in ISR context»
+    // (бэкстрейс: locks.c:139 ← _tzset ← localtime ← hist_add).
+    char stamp[12];
+    time_hm(stamp, sizeof(stamp));
+
     portENTER_CRITICAL(&lk_mux);
     AiHistEntry& e = hist[hist_head];
     memset(&e, 0, sizeof(e));
     e.type = type;
-    now_hm(e.time, sizeof(e.time));
+    strncpy(e.time, stamp, sizeof(e.time) - 1);
     strncpy(e.q, q ? q : "", AI_HIST_Q - 1);
     strncpy(e.a, a ? a : "", AI_HIST_A - 1);
     utf8_cut(e.q, AI_HIST_Q);
@@ -371,7 +374,19 @@ static void json_escape_write(String& out, const char* s) {
 
 // ---------- HTTP-обработчики (HTTP-задача) ----------
 
+// Время с телефона (заголовки X-Time/X-Tz) — см. services/time_service.
+// NTP недоступен (ESP не в интернете), поэтому часы заводим от телефона.
+static void time_from_headers() {
+    String th = server.header("X-Time");
+    if (th.length())
+        time_service_set_utc(strtoll(th.c_str(), nullptr, 10));
+    String tz = server.header("X-Tz");
+    if (tz.length())
+        time_service_set_tz((int32_t)strtol(tz.c_str(), nullptr, 10));
+}
+
 static void h_state() {
+    time_from_headers();
     char name[32];
     char buf[288];
     portENTER_CRITICAL(&lk_mux);
@@ -419,6 +434,7 @@ static void h_photo() {
 
 // Общий обработчик ответа: вопрос (опц., URL-encoded в заголовке) + текст
 static void handle_chat_reply() {
+    time_from_headers();
     String id_h = server.header("X-Id");
     String q_h = server.header("X-Question");
     String body = server.arg("plain");
@@ -456,6 +472,7 @@ static void h_answer() { handle_chat_reply(); }
 // POST /api/question — вопрос с телефона без ответа (type=2, рисуется «…»,
 // пока ИИ не ответит через /api/chat или /api/answer)
 static void h_question() {
+    time_from_headers();
     String q_h = server.header("X-Question");
     char qdec[AI_HIST_Q];
     url_decode(q_h.c_str(), qdec, sizeof(qdec));
@@ -734,8 +751,8 @@ void ai_link_init() {
 
     hist_load();   // до обработчиков: файл читаем один раз при загрузке
 
-    const char* hdr_keys[] = {"X-Id", "X-Question"};
-    server.collectHeaders(hdr_keys, 2);
+    const char* hdr_keys[] = {"X-Id", "X-Question", "X-Time", "X-Tz"};
+    server.collectHeaders(hdr_keys, 4);
     server.on("/", HTTP_GET, h_root);
     server.on("/api/state", HTTP_GET, h_state);
     server.on("/api/photo", HTTP_GET, h_photo);

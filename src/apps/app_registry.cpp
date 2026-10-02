@@ -33,10 +33,11 @@ AppContext* app_registry_get(int index) {
     return &apps[index];
 }
 
-AppContext* app_registry_get_running() {
-    for (int i = 0; i < app_count; i++) {
-        if (apps[i].is_running) return &apps[i];
+AppContext* app_registry_get_running() {    
+    for (auto app : apps) {
+        if (app.is_running) return &app;
     }
+
     return nullptr;
 }
 

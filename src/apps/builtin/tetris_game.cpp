@@ -15,8 +15,8 @@
 #define CANVAS_H   210
 #define PANEL_W    60
 #define PANEL_GAP  20
-#define FIELD_X    ((CANVAS_W - (FCOLS * TCELL + PANEL_GAP + PANEL_W)) / 2)  // 70
-#define FIELD_Y    ((CANVAS_H - FROWS * TCELL) / 2)                          // 5
+constexpr uint16_t FIELD_X = ((CANVAS_W - (FCOLS * TCELL + PANEL_GAP + PANEL_W)) / 2);  // 70
+constexpr uint16_t FIELD_Y =  ((CANVAS_H - FROWS * TCELL) / 2);                          // 5
 #define NEXT_X     (FIELD_X + FCOLS * TCELL + PANEL_GAP)                     // 190
 #define NEXT_Y     65
 
