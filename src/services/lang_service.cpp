@@ -25,6 +25,8 @@ struct LangStrings {
     const char* camera_error;
     const char* camera_failed;
     const char* camera_focusing;
+    const char* camera_shooting;
+    const char* camera_saving;
     const char* camera_mode_fill;
     const char* camera_mode_fit;
     const char* explorer_title;
@@ -64,6 +66,8 @@ static const LangStrings lang_en = {
     .camera_error = "Save failed",
     .camera_failed   = "Camera init failed",
     .camera_focusing = "Autofocus...",
+    .camera_shooting = "Shooting...",
+    .camera_saving = "Shot! Saving...",
     .camera_mode_fill = "Full width",
     .camera_mode_fit = "Full frame",
     .explorer_title  = "Explorer",
@@ -103,6 +107,8 @@ static const LangStrings lang_ru = {
     .camera_error = "Ошибка сохранения",
     .camera_failed   = "Ошибка камеры",
     .camera_focusing = "Автофокус...",
+    .camera_shooting = "Снимаю...",
+    .camera_saving = "Снято! Сохраняю...",
     .camera_mode_fill = "Во всю ширину",
     .camera_mode_fit = "Весь кадр",
     .explorer_title  = "Проводник",
@@ -165,6 +171,8 @@ const char* lang_str_camera_no_camera() { return langs[current_lang]->camera_no_
 const char* lang_str_camera_error()    { return langs[current_lang]->camera_error; }
 const char* lang_str_camera_failed()  { return langs[current_lang]->camera_failed; }
 const char* lang_str_camera_focusing(){ return langs[current_lang]->camera_focusing; }
+const char* lang_str_camera_shooting(){ return langs[current_lang]->camera_shooting; }
+const char* lang_str_camera_saving() { return langs[current_lang]->camera_saving; }
 const char* lang_str_camera_mode_fill(){ return langs[current_lang]->camera_mode_fill; }
 const char* lang_str_camera_mode_fit() { return langs[current_lang]->camera_mode_fit; }
 const char* lang_str_app_explorer()   { return langs[current_lang]->app_explorer; }

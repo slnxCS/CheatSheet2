@@ -24,6 +24,8 @@ const char* lang_str_camera_no_camera();
 const char* lang_str_camera_error();
 const char* lang_str_camera_failed();
 const char* lang_str_camera_focusing();
+const char* lang_str_camera_shooting();
+const char* lang_str_camera_saving();
 const char* lang_str_camera_mode_fill();
 const char* lang_str_camera_mode_fit();
 const char* lang_str_app_ai();

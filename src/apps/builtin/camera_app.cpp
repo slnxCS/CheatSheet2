@@ -248,6 +248,8 @@ static void pv_task_fn(void* arg) {
 // горизонтального/вертикального градиента яркости) на кадре 1/4 UXGA.
 // Кадр обязателен свежий — снятый уже после установки DAC.
 static uint64_t af_since_ms = 0;
+static uint32_t last_af_sharp = 0;   // резкость последнего удачного перебора
+static bool focus_learned = false;    // был хотя бы один настоящий AF
 
 static inline int af_luma(uint16_t p) {
     // приближение яркости из RGB565: 3*R + 6*Г + 1*B
@@ -305,6 +307,8 @@ static int run_autofocus(int start_pos, bool fast = false) {
         }
         if (!at_edge) {                         // пик внутри окна — этого достаточно
             camera_set_focus(best);
+            focus_learned = true;
+            last_af_sharp = bestm;
             Serial.printf("AF fast: pos=%d sharp=%u\n", best, bestm);
             return best;
         }
@@ -342,8 +346,59 @@ static int run_autofocus(int start_pos, bool fast = false) {
     }
 
     camera_set_focus(best);
+    focus_learned = true;
+    last_af_sharp = bestm;
     Serial.printf("AF done: pos=%d sharp=%u\n", best, bestm);
     return best;
+}
+
+// --- Быстрая проверка фокуса перед снимком ---
+// Перебор каждый раз — 0.7–2.6 с, в течение которых камеру нельзя двигать.
+// Проверяем дешевле:
+//   1) резкость на текущей позиции ≥ 80% от последнего удачного AF — 1 кадр;
+//   2) резкость не та (другая дистанция) — локальный пик ±64: 3 кадра,
+//      все три на одной и той же сцене, содержимое кадра не влияет;
+//   3) пик не найден — настоящий перебор (fast; по краю окна — полный).
+// Первый кадр после включения — всегда настоящий перебор (базы ещё нет).
+static int ensure_focus() {
+    if (!camera_is_ready() || !temp_buf) return cam_focus;
+    if (!focus_learned) return run_autofocus(cam_focus, /*fast=*/true);
+
+    // 1) Обычно дистанция не менялась — один кадр и готово
+    if (last_af_sharp > 0) {
+        camera_set_focus(cam_focus);
+        delay(5);
+        af_since_ms = millis();
+        uint32_t m = measure_sharpness();
+        // 64-битно: суммы резкости бывают до ~10^8, ×100 переполнил бы uint32
+        if ((uint64_t)m * 100 >= (uint64_t)last_af_sharp * 80) {
+            Serial.printf("AF skip: pos=%d sharp=%u/%u\n",
+                          cam_focus, m, last_af_sharp);
+            return cam_focus;
+        }
+    }
+
+    // 2) Локальный пик ±64 на текущей сцене
+    static const int P[3] = {0, -64, 64};
+    uint32_t ms[3] = {0, 0, 0};
+    for (int i = 0; i < 3; i++) {
+        int p = cam_focus + P[i];
+        if (p < 0 || p > 1023) continue;
+        camera_set_focus(p);
+        delay(5);
+        af_since_ms = millis();
+        ms[i] = measure_sharpness();
+    }
+    camera_set_focus(cam_focus);
+    if (ms[0] > 0 && ms[0] >= ms[1] && ms[0] >= ms[2]) {
+        last_af_sharp = ms[0];   // сцена могла смениться — база обновлена
+        Serial.printf("AF skip(peak): pos=%d %u >= %u,%u\n",
+                      cam_focus, ms[0], ms[1], ms[2]);
+        return cam_focus;
+    }
+
+    // 3) Фокус уехал — настоящий перебор
+    return run_autofocus(cam_focus, /*fast=*/true);
 }
 
 // --- JPEGENC: запись напрямую в открытый File ---
@@ -470,20 +525,22 @@ static bool save_photo(const uint8_t* jpeg_data, size_t jpeg_len, size_t* out_si
 }
 
 // --- Снимок из другого приложения (кнопка «Сфоткать» в чате «ИИ») ---
-// Приложение камеры закрыто → камера не инициализирована: поднимаем её на
-// время снимка, гоняем тот же AF и сохраняем тем же save_photo.
+// Приложение камеры закрыто: если камера не «тёплая» — поднимаем её на
+// время снимка, проверяем/гоняем тот же AF и сохраняем тем же save_photo.
 //
 // Всё выполняется в ОТДЕЛЬНОЙ задаче с большим стеком на ядре 1: раньше
 // цепочка шла в loopTask (8 КБ, ядро 0) и перезагружала консоль, плюс
 // LVGL на несколько секунд замирал. LVGL только опрашивает cap_stage.
 
-static volatile int      cap_stage = -1;   // -1 нет; 0..2 идёт; 3 успех; 4 ошибка
+// «Тёплая» камера: гасим через 60 с простоя (camera_app_warm_poll из loop)
+static volatile uint32_t cam_warm_until = 0;
+
+static volatile int      cap_stage = -1;   // -1 нет; 0..3 идёт; 4 успех; 5 ошибка
 static volatile unsigned cap_kb = 0;
 static volatile bool     cap_task_alive = false;
 
 static void cap_task_fn(void*) {
     bool ok = false;
-    bool inited_here = false;
     bool tmp_here = false;
     unsigned kb = 0;
 
@@ -493,7 +550,6 @@ static void cap_task_fn(void*) {
     do {
         if (!camera_is_ready()) {
             if (!camera_init()) break;
-            inited_here = true;
         }
         if (!temp_buf) {
             temp_buf = (uint8_t*)ps_malloc(AF_W * AF_H * 2);
@@ -501,14 +557,16 @@ static void cap_task_fn(void*) {
             tmp_here = true;
         }
 
-        cap_stage = 1;   // автофокус (быстрый: вокруг прошлой позиции)
-        cam_focus = run_autofocus(cam_focus, /*fast=*/true);
+        cap_stage = 1;   // фокус: быстрая проверка, иначе перебор
+        cam_focus = ensure_focus();
 
-        cap_stage = 2;   // снимок + сохранение
+        cap_stage = 2;   // экспозиция
         uint8_t* jb = nullptr;
         size_t jl = 0;
         if (!camera_capture(&jb, &jl)) break;
 
+        // Кадр снят — с этого момента камеру можно двигать, идёт сохранение
+        cap_stage = 3;
         size_t saved = 0;
         ok = save_photo(jb, jl, &saved);   // внутри ставит фото в очередь ИИ
         camera_release();
@@ -516,10 +574,12 @@ static void cap_task_fn(void*) {
     } while (0);
 
     if (tmp_here && temp_buf) { free(temp_buf); temp_buf = nullptr; }
-    if (inited_here) camera_deinit();
+    // Камеру НЕ гасим: 60 с «тёплой» — повторный снимок без camera_init
+    // (~0.5–1 с экономии). Гасит camera_app_warm_poll() из loop().
+    if (camera_is_ready()) cam_warm_until = millis() + 60000;
 
     cap_kb = kb;
-    cap_stage = ok ? 3 : 4;
+    cap_stage = ok ? 4 : 5;
     cap_task_alive = false;
     Serial.printf("cap: done ok=%d (%u KB)\n", ok ? 1 : 0, kb);
     vTaskDelete(nullptr);
@@ -546,6 +606,18 @@ int camera_app_capture_poll(unsigned* kb) {
     return cap_stage;
 }
 
+// Гасим «тёплую» камеру после 60 с простоя. Вызывается из loop() — тот же
+// поток, что LVGL (снимок/закрытие приложения из LVGL не пересекаются),
+// а капча-задача на ядре 1 выставляет cam_warm_until ДО снятия
+// cap_task_alive, поэтому при живой задаче мы просто выходим.
+void camera_app_warm_poll() {
+    if (!cam_warm_until || parent_ref || cap_task_alive) return;
+    if ((int32_t)(millis() - cam_warm_until) < 0) return;
+    cam_warm_until = 0;
+    camera_deinit();
+    Serial.println("cam: warm timeout, deinit");
+}
+
 void camera_app_open(lv_obj_t* parent) {
     // Фоновый снимок из чата «ИИ» ещё идёт — двойной camera_init = паника.
     // Редкий случай: подождать окончания (снимок ≤ ~15 с).
@@ -560,8 +632,8 @@ void camera_app_open(lv_obj_t* parent) {
     preview_active = false;
     saving = false;
     cam_brightness = 0;
-    cam_focus = 512;
     preview_fill = true;
+    cam_warm_until = 0;   // камера под управлением приложения — не глушим
 
     lv_obj_set_style_bg_color(parent, lv_color_hex(0x000000), 0);
 
@@ -617,11 +689,12 @@ void camera_app_open(lv_obj_t* parent) {
 
     preview_active = true;
 
-    // Автофокус при открытии: ~2-2.5 с, статус виден сразу
+    // Фокус при открытии: быстрая проверка (~0.2–0.7 с), полный перебор
+    // только если фокус уехал; статус виден сразу
     lv_label_set_text_fmt(lbl_status, "%s %s",
                           LV_SYMBOL_REFRESH, lang_str_camera_focusing());
     lv_refr_now(lv_display_get_default());
-    cam_focus = run_autofocus(cam_focus);
+    cam_focus = ensure_focus();
 
     lv_label_set_text_fmt(lbl_status, "%s %s  |  B:%d F:%d",
                           LV_SYMBOL_IMAGE, lang_str_camera_ready(),
@@ -653,7 +726,9 @@ void camera_app_close() {
     }
     pv_stop = false;
 
-    camera_deinit();
+    // Камеру НЕ гасим сразу: 60 с «тёплой» — повторное открытие/снимок
+    // без camera_init (~0.5–1 с). Гасит camera_app_warm_poll() из loop().
+    if (camera_is_ready()) cam_warm_until = millis() + 60000;
 
     if (canvas_buf) { free(canvas_buf); canvas_buf = nullptr; }
     if (work_buf) { free(work_buf); work_buf = nullptr; }
@@ -710,18 +785,20 @@ void camera_app_button(int button_id, int event) {
         // Дождаться воркера: он держит fb камеры и использует temp_buf
         wait_preview_idle();
 
-        // 1) Сначала автофокус — чтобы текст в файле был читаем.
-        //    Плашка появляется мгновенно: видно, что нажатие сработало.
+        // 1) Фокус: быстрая проверка «ещё годный» (~0.2–0.7 с), полный
+        //    перебор только если фокус уехал. Плашка появляется мгновенно:
+        //    видно, что нажатие сработало.
         toast_set(lang_str_camera_focusing(), lv_color_hex(0x2C6FBF));
         lv_label_set_text_fmt(lbl_status, "%s %s",
                               LV_SYMBOL_REFRESH, lang_str_camera_focusing());
         lv_refr_now(lv_display_get_default());
-        cam_focus = run_autofocus(cam_focus);
+        cam_focus = ensure_focus();
 
-        // 2) Плашка «Снято» — фото будет сохранено
-        toast_set(lang_str_camera_captured(), lv_color_hex(0x1B7F3B));
+        // 2) Кадр: плашка «Снимаю…»; «Снято» — ТОЛЬКО после экспозиции,
+        //    чтобы было видно момент, когда камеру можно двигать.
+        toast_set(lang_str_camera_shooting(), lv_color_hex(0x2C6FBF));
         lv_label_set_text_fmt(lbl_status, "%s %s",
-                              LV_SYMBOL_REFRESH, lang_str_camera_captured());
+                              LV_SYMBOL_REFRESH, lang_str_camera_shooting());
         lv_refr_now(lv_display_get_default());
 
         uint8_t* jpeg_buf = nullptr;
@@ -734,6 +811,12 @@ void camera_app_button(int button_id, int event) {
             schedule_resume(1500);
             return;
         }
+
+        // Экспозиция сделана — дальше камеру можно не держать неподвижно
+        toast_set(lang_str_camera_captured(), lv_color_hex(0x1B7F3B));
+        lv_label_set_text_fmt(lbl_status, "%s %s",
+                              LV_SYMBOL_REFRESH, lang_str_camera_captured());
+        lv_refr_now(lv_display_get_default());
 
         // Показать захват на экране (1/4 scale, как предпросмотр)
         int dec_w = 0, dec_h = 0;

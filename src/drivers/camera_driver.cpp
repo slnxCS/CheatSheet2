@@ -37,6 +37,8 @@ static void ov5640_set_focus(int pos) {
 }
 
 bool camera_init() {
+    if (cam_ready) return true;   // уже «тёплая» (см. camera_app_warm_poll):
+                                  // повторный esp_camera_init = паника
     camera_config_t config = {};
     config.ledc_channel = LEDC_CHANNEL_0;
     config.ledc_timer = LEDC_TIMER_0;
@@ -104,6 +106,7 @@ bool camera_init() {
 }
 
 void camera_deinit() {
+    if (!cam_ready) return;   // не инициализирована — deinit не нужен
     esp_camera_deinit();
     cam_ready = false;
     current_fb = nullptr;

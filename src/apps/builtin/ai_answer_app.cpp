@@ -210,14 +210,19 @@ static void capture_stage(int stage, unsigned arg) {
             break;
         case 2:
             snprintf(buf, sizeof(buf), "%s %s",
-                     LV_SYMBOL_IMAGE, lang_str_camera_captured());
+                     LV_SYMBOL_REFRESH, lang_str_camera_shooting());
             break;
         case 3:
+            snprintf(buf, sizeof(buf), "%s %s",
+                     LV_SYMBOL_OK, lang_str_camera_saving());
+            bg = lv_color_hex(0x1B7F3B);
+            break;
+        case 4:
             snprintf(buf, sizeof(buf), "%s %s (%u KB)",
                      LV_SYMBOL_OK, lang_str_camera_captured(), arg);
             bg = lv_color_hex(0x1B7F3B);
             break;
-        case 4:
+        case 5:
             snprintf(buf, sizeof(buf), "%s %s",
                      LV_SYMBOL_WARNING, lang_str_camera_error());
             bg = lv_color_hex(0xB33A3A);
@@ -225,15 +230,16 @@ static void capture_stage(int stage, unsigned arg) {
         default:
             return;
     }
-    toast_show(buf, (stage == 3 || stage == 4) ? (stage == 3 ? 1500 : 2000) : 0, bg);
+    toast_show(buf, (stage == 4 || stage == 5) ? (stage == 4 ? 1500 : 2000) : 0, bg);
     // Успех: фото уже в истории чата (save_photo → ai_link_notify_photo),
     // лента обновится сама по hist_seq.
 }
 
-// идёт фоновый снимок (0..2)? — кнопки не реагируют
+// идёт фоновый снимок (0..3, пока 3 = кадр снят, сохраняется)?
+// — кнопки не реагируют
 static bool capture_busy() {
     int st = camera_app_capture_poll(nullptr);
-    return st >= 0 && st <= 2;
+    return st >= 0 && st <= 3;
 }
 
 static void action_capture() {

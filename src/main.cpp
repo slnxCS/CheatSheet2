@@ -208,5 +208,6 @@ void loop() {
     input_update();
     ui_manager_update();
     lv_timer_handler();
+    camera_app_warm_poll();   // погасить «тёплую» камеру после 60 с простоя
     delay(2);
 }
