@@ -33,11 +33,14 @@ AppContext* app_registry_get(int index) {
     return &apps[index];
 }
 
-AppContext* app_registry_get_running() {    
-    for (auto app : apps) {
-        if (app.is_running) return &app;
+AppContext* app_registry_get_running() {
+    // ВАЖНО: индексный цикл — указатель на ЭЛЕМЕНТ МАССИВА.
+    // for (auto app : apps) + return &app возвращал бы адрес локальной
+    // копии (dangling) → main.cpp читал мусор и молча не отправлял
+    // кнопки в приложение («управление не работает нигде»).
+    for (int i = 0; i < app_count; i++) {
+        if (apps[i].is_running) return &apps[i];
     }
-
     return nullptr;
 }
 
